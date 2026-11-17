@@ -82,7 +82,7 @@ impl AgentExecutor for PiAgentExecutor {
                 memory.display()
             ));
         }
-        let handoff = record_handoff(memory, &step.id, previous_result)?;
+        let handoff = record_handoff(memory, &agent.name, &step.id, previous_result)?;
         let prompt = format!(
             "{}\n\nFactory pipeline step: `{}` (agent `{}`). Read the run context at `{}` before acting and update that same file with your findings and decisions.\n\n{}\n\nWhen finished, your final response MUST be exactly one JSON object with string keys `outcome` and `output`, for example {{\"outcome\":\"success\",\"output\":\"Implemented changes\"}}. Do not wrap it in markdown. Allowed outcomes for this agent are: {}.",
             agent.prompt,
@@ -180,6 +180,9 @@ impl AgentExecutor for PiAgentExecutor {
                 allowed.join(" or ")
             ));
         }
+        if agent.name == "reviewer" && response.outcome == "changes_requested" {
+            validate_review_handoff(&response.output)?;
+        }
         Ok(StepOutput {
             outcome: response.outcome,
             output: response.output,
@@ -190,29 +193,27 @@ impl AgentExecutor for PiAgentExecutor {
 
 fn record_handoff(
     memory: &Path,
+    receiving_agent: &str,
     receiving_step: &str,
     previous_result: Option<&StepResult>,
 ) -> Result<String, String> {
     let Some(previous) = previous_result else {
         return Ok("No previous pipeline-step result.".into());
     };
-    let output = previous
-        .output
-        .chars()
-        .take(MAX_HANDOFF_CHARS)
-        .collect::<String>();
-    let truncated = previous.output.chars().count() > MAX_HANDOFF_CHARS;
+    if previous.output.chars().count() > MAX_HANDOFF_CHARS {
+        return Err(format!(
+            "previous step `{}` returned a handoff over the {MAX_HANDOFF_CHARS}-character limit; refusing to truncate it",
+            previous.step_id
+        ));
+    }
+    let coder_guidance = if receiving_agent == "coder" && previous.outcome == "changes_requested" {
+        " This is the complete review handoff: do not read another agent's private run Markdown; use and address these findings in your own run file."
+    } else {
+        " Treat this as required handoff context and address its findings or failures before repeating work."
+    };
     let handoff = format!(
-        "Previous pipeline-step result (step `{}`, outcome `{}`, exit code {:?}):\n{}{}\nTreat this as required handoff context. Address its findings or failures before repeating work.",
-        previous.step_id,
-        previous.outcome,
-        previous.exit_code,
-        output,
-        if truncated {
-            "\n[output truncated]"
-        } else {
-            ""
-        }
+        "Previous pipeline-step result (step `{}`, outcome `{}`, exit code {:?}):\n{}{}",
+        previous.step_id, previous.outcome, previous.exit_code, previous.output, coder_guidance
     );
     let section = format!("\n\n## Handoff before step `{receiving_step}`\n\n{handoff}\n");
     OpenOptions::new()
@@ -292,6 +293,44 @@ fn parse_final_response(output: &str) -> Result<AgentResponse, String> {
     })
 }
 
+fn validate_review_handoff(output: &str) -> Result<(), String> {
+    let findings = output.split("### Finding:").skip(1).collect::<Vec<_>>();
+    if findings.is_empty() {
+        return Err(
+            "reviewer changes_requested output must contain structured `### Finding:` entries"
+                .into(),
+        );
+    }
+    for (index, finding) in findings.iter().enumerate() {
+        let title = finding.lines().next().unwrap_or_default().trim();
+        if title.is_empty() {
+            return Err(format!("review finding {} is missing its title", index + 1));
+        }
+        for field in [
+            "- Location:",
+            "- Problem:",
+            "- Required change:",
+            "- Verification:",
+        ] {
+            let has_value = finding
+                .lines()
+                .find_map(|line| line.trim().strip_prefix(field))
+                .is_some_and(|value| !value.trim().is_empty());
+            if !has_value {
+                return Err(format!(
+                    "review finding `{title}` must include a non-empty `{field}` field"
+                ));
+            }
+        }
+    }
+    if output.chars().count() > MAX_HANDOFF_CHARS {
+        return Err(format!(
+            "review handoff exceeds the {MAX_HANDOFF_CHARS}-character limit"
+        ));
+    }
+    Ok(())
+}
+
 fn allowed_outcomes(agent: &str) -> Vec<&'static str> {
     match agent {
         "coder" => vec!["success", "failure"],
@@ -334,6 +373,21 @@ mod tests {
         let result = parse_final_response(&transcript).unwrap();
         assert_eq!(result.outcome, "approved");
         assert_eq!(result.output, "Looks good");
+    }
+
+    #[test]
+    fn requires_actionable_review_findings_for_changes_requested() {
+        let handoff = "### Finding: Resume skips completed steps\n- Location: packages/factory-core/src/run.rs\n- Problem: Completed steps run again after resume.\n- Required change: Persist and reload completed step IDs.\n- Verification: Resume test asserts the completed step executes once.";
+        assert!(validate_review_handoff(handoff).is_ok());
+        assert!(validate_review_handoff("See 01-reviewer.md for details").is_err());
+        assert!(validate_review_handoff(
+            "### Finding: Missing test\n- Location: packages/factory-cli/src/lib.rs\n- Problem: No resume test.\n- Required change: Add the test."
+        )
+        .is_err());
+        assert!(
+            validate_review_handoff(&format!("{handoff}{}", "x".repeat(MAX_HANDOFF_CHARS)))
+                .is_err()
+        );
     }
 
     #[test]
@@ -388,7 +442,7 @@ mod tests {
         let previous = StepResult {
             step_id: "review".into(),
             outcome: "changes_requested".into(),
-            output: "Add tests for persisted resume behavior".into(),
+            output: "### Finding: Missing resume coverage\n- Location: packages/factory-cli/src/lib.rs\n- Problem: Resume behavior is not tested.\n- Required change: Add a persisted resume integration test.\n- Verification: Test confirms completed steps are not rerun.".into(),
             exit_code: None,
         };
         assert_eq!(
@@ -407,10 +461,12 @@ mod tests {
         assert!(args.contains("Do the task"));
         assert!(args.contains(memory.to_str().unwrap()));
         assert!(args.contains("changes_requested"));
-        assert!(args.contains("Add tests for persisted resume behavior"));
+        assert!(args.contains("Missing resume coverage"));
+        assert!(args.contains("do not read another agent's private run Markdown"));
         let saved_memory = std::fs::read_to_string(&memory).unwrap();
         assert!(saved_memory.contains("Handoff before step `implement`"));
-        assert!(saved_memory.contains("Add tests for persisted resume behavior"));
+        assert!(saved_memory.contains("Required change: Add a persisted resume integration test."));
+        assert!(saved_memory.contains("do not read another agent's private run Markdown"));
         std::fs::remove_dir_all(root).unwrap();
     }
 
