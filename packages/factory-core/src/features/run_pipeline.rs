@@ -5,7 +5,7 @@ use std::{collections::HashMap, error::Error, fmt};
 use crate::{AgentDefinition, Pipeline, Step, StepKind};
 
 use super::{
-    ports::{AgentRunner, ShellRunner},
+    ports::{AgentRunner, RunJournal, ShellRunner},
     run::{RunReport, RunStatus, StepResult},
 };
 
@@ -18,6 +18,8 @@ pub enum RunError {
     AmbiguousOutcome { step_id: String, outcome: String },
     MissingTarget { step_id: String, target: String },
     StepLimitExceeded { limit: usize },
+    JournalFailed { message: String },
+    InvalidResumeState { message: String },
     InvalidStepKind { step_id: String },
 }
 
@@ -46,6 +48,10 @@ impl fmt::Display for RunError {
             Self::StepLimitExceeded { limit } => {
                 write!(f, "pipeline exceeded the step execution limit of {limit}")
             }
+            Self::JournalFailed { message } => {
+                write!(f, "could not persist pipeline run: {message}")
+            }
+            Self::InvalidResumeState { message } => write!(f, "cannot resume pipeline: {message}"),
             Self::InvalidStepKind { step_id } => {
                 write!(f, "step `{step_id}` has an invalid runner kind")
             }
@@ -55,7 +61,7 @@ impl fmt::Display for RunError {
 
 impl Error for RunError {}
 
-/// Runs a pipeline from its first step, following explicit outcome transitions.
+/// Runs a pipeline from its first step with an in-memory no-op journal.
 /// `success` and `failure` are terminal outcomes when no transition handles them.
 pub fn run_pipeline<A: AgentRunner, S: ShellRunner>(
     pipeline: &Pipeline,
@@ -64,7 +70,29 @@ pub fn run_pipeline<A: AgentRunner, S: ShellRunner>(
     shell_runner: &mut S,
     max_step_executions: usize,
 ) -> Result<RunReport, RunError> {
-    let Some(mut current_id) = pipeline.steps.first().map(|step| step.id.as_str()) else {
+    let mut journal = NoopJournal;
+    run_pipeline_with_journal(
+        pipeline,
+        agents,
+        agent_runner,
+        shell_runner,
+        &[],
+        &mut journal,
+        max_step_executions,
+    )
+}
+
+/// Resumes from persisted completed results and journals each execution attempt.
+pub fn run_pipeline_with_journal<A: AgentRunner, S: ShellRunner, J: RunJournal>(
+    pipeline: &Pipeline,
+    agents: &[AgentDefinition],
+    agent_runner: &mut A,
+    shell_runner: &mut S,
+    completed_steps: &[StepResult],
+    journal: &mut J,
+    max_step_executions: usize,
+) -> Result<RunReport, RunError> {
+    let Some(first_step) = pipeline.steps.first() else {
         return Err(RunError::EmptyPipeline);
     };
     let step_index: HashMap<&str, &Step> = pipeline
@@ -76,7 +104,64 @@ pub fn run_pipeline<A: AgentRunner, S: ShellRunner>(
         .iter()
         .map(|agent| (agent.name.as_str(), agent))
         .collect();
-    let mut results = Vec::new();
+    let mut results = Vec::with_capacity(completed_steps.len());
+    let mut current_id = first_step.id.clone();
+
+    for (index, saved) in completed_steps.iter().enumerate() {
+        if saved.step_id != current_id {
+            return Err(RunError::InvalidResumeState {
+                message: format!(
+                    "saved step `{}` does not follow expected step `{current_id}`",
+                    saved.step_id
+                ),
+            });
+        }
+        let step = step_index[current_id.as_str()];
+        let mut matching = step
+            .transitions
+            .iter()
+            .filter(|t| t.outcome == saved.outcome);
+        let Some(transition) = matching.next() else {
+            if index + 1 != completed_steps.len() {
+                return Err(RunError::InvalidResumeState {
+                    message: format!(
+                        "saved terminal outcome `{}` from step `{}` is followed by more results",
+                        saved.outcome, saved.step_id
+                    ),
+                });
+            }
+            let status = match saved.outcome.as_str() {
+                "success" => RunStatus::Succeeded,
+                "failure" => RunStatus::Failed,
+                _ => {
+                    return Err(RunError::UnknownOutcome {
+                        step_id: step.id.clone(),
+                        outcome: saved.outcome.clone(),
+                    });
+                }
+            };
+            results.push(saved.clone());
+            return Ok(RunReport {
+                pipeline_name: pipeline.name.clone(),
+                status,
+                steps: results,
+            });
+        };
+        if matching.next().is_some() {
+            return Err(RunError::AmbiguousOutcome {
+                step_id: step.id.clone(),
+                outcome: saved.outcome.clone(),
+            });
+        }
+        if !step_index.contains_key(transition.target_step.as_str()) {
+            return Err(RunError::MissingTarget {
+                step_id: step.id.clone(),
+                target: transition.target_step.clone(),
+            });
+        }
+        current_id = transition.target_step.clone();
+        results.push(saved.clone());
+    }
 
     loop {
         if results.len() >= max_step_executions {
@@ -85,16 +170,19 @@ pub fn run_pipeline<A: AgentRunner, S: ShellRunner>(
             });
         }
         let step = step_index
-            .get(current_id)
+            .get(current_id.as_str())
             .copied()
             .ok_or_else(|| RunError::MissingTarget {
                 step_id: results
                     .last()
                     .map_or_else(String::new, |r: &StepResult| r.step_id.clone()),
-                target: current_id.to_owned(),
+                target: current_id.clone(),
             })?;
+        journal
+            .step_started(&step.id)
+            .map_err(|message| RunError::JournalFailed { message })?;
 
-        let output = match &step.kind {
+        let execution = match &step.kind {
             StepKind::Agent { agent } => {
                 let definition = agent_index.get(agent.as_str()).copied().ok_or_else(|| {
                     RunError::MissingAgent {
@@ -105,19 +193,35 @@ pub fn run_pipeline<A: AgentRunner, S: ShellRunner>(
                 agent_runner.run(definition, step, results.last())
             }
             StepKind::Shell { .. } => shell_runner.run(step),
-        }
-        .map_err(|message| RunError::RunnerFailed {
-            step_id: step.id.clone(),
-            message,
-        })?;
+        };
+        let output = match execution {
+            Ok(output) => output,
+            Err(message) => {
+                journal
+                    .step_failed(&step.id, &message)
+                    .map_err(|journal_error| RunError::JournalFailed {
+                        message: journal_error,
+                    })?;
+                return Err(RunError::RunnerFailed {
+                    step_id: step.id.clone(),
+                    message,
+                });
+            }
+        };
 
-        let outcome = output.outcome;
-        results.push(StepResult {
+        let result = StepResult {
             step_id: step.id.clone(),
-            outcome: outcome.clone(),
+            outcome: output.outcome,
             output: output.output,
             exit_code: output.exit_code,
-        });
+            runner_attempts: output.attempts,
+            handoff: output.handoff,
+        };
+        journal
+            .step_completed(&result)
+            .map_err(|message| RunError::JournalFailed { message })?;
+        let outcome = result.outcome.clone();
+        results.push(result);
 
         let mut matching = step.transitions.iter().filter(|t| t.outcome == outcome);
         if let Some(transition) = matching.next() {
@@ -133,7 +237,7 @@ pub fn run_pipeline<A: AgentRunner, S: ShellRunner>(
                     target: transition.target_step.clone(),
                 });
             }
-            current_id = step_index[transition.target_step.as_str()].id.as_str();
+            current_id = transition.target_step.clone();
             continue;
         }
 
@@ -156,12 +260,50 @@ pub fn run_pipeline<A: AgentRunner, S: ShellRunner>(
     }
 }
 
+struct NoopJournal;
+
+impl RunJournal for NoopJournal {
+    fn step_started(&mut self, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn step_completed(&mut self, _: &StepResult) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn step_failed(&mut self, _: &str, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::ports::StepOutput;
+    use super::super::ports::{RunJournal, StepOutput};
     use super::*;
     use crate::{ModelRef, StepKind, Transition};
     use std::collections::VecDeque;
+
+    #[derive(Default)]
+    struct RecordingJournal {
+        events: Vec<String>,
+    }
+
+    impl RunJournal for RecordingJournal {
+        fn step_started(&mut self, step_id: &str) -> Result<(), String> {
+            self.events.push(format!("started:{step_id}"));
+            Ok(())
+        }
+
+        fn step_completed(&mut self, result: &StepResult) -> Result<(), String> {
+            self.events.push(format!("completed:{}", result.step_id));
+            Ok(())
+        }
+
+        fn step_failed(&mut self, step_id: &str, _: &str) -> Result<(), String> {
+            self.events.push(format!("failed:{step_id}"));
+            Ok(())
+        }
+    }
 
     struct FakeRunner {
         outputs: VecDeque<Result<StepOutput, String>>,
@@ -178,6 +320,8 @@ mod tests {
                             outcome: (*outcome).into(),
                             output: format!("output-{outcome}"),
                             exit_code: None,
+                            attempts: 1,
+                            handoff: None,
                         })
                     })
                     .collect(),
@@ -275,6 +419,44 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["build", "test"]
         );
+    }
+
+    #[test]
+    fn resumes_after_saved_steps_without_rerunning_them_and_journals_new_steps() {
+        let pipeline = Pipeline {
+            name: "resume".into(),
+            steps: vec![
+                agent_step("build", &[("success", "test")]),
+                shell_step("test"),
+            ],
+        };
+        let completed = [StepResult {
+            step_id: "build".into(),
+            outcome: "success".into(),
+            output: "already built".into(),
+            exit_code: Some(0),
+            runner_attempts: 1,
+            handoff: None,
+        }];
+        let mut agents = FakeRunner::with(&[]);
+        let mut shells = FakeRunner::with(&["success"]);
+        let mut journal = RecordingJournal::default();
+
+        let report = run_pipeline_with_journal(
+            &pipeline,
+            &[agent()],
+            &mut agents,
+            &mut shells,
+            &completed,
+            &mut journal,
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(report.status, RunStatus::Succeeded);
+        assert_eq!(report.steps.len(), 2);
+        assert!(agents.previous_results.is_empty(), "saved build was rerun");
+        assert_eq!(journal.events, ["started:test", "completed:test"]);
     }
 
     #[test]

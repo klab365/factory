@@ -7,15 +7,9 @@ Prüfe die Änderungen dieses Runs anhand des Auftrags.
 Untersuche den Git-Diff und dokumentiere deine vollständige 
 Begründung in deiner persönlichen Run-Datei unter `.factory/runs/<run-id>/`.
 
-Bei `approved`: Gib im Feld `output` eine kurze Begründung.
-Bei `changes_requested`: Das Feld `output` ist der vollständige Handoff an den Coder. Gib für jeden konkreten Befund genau einen Block mit diesem Format aus:
-### Finding: <kurzer Titel>
-- Location: <Datei und möglichst Zeile oder Symbol>
-- Problem: <konkrete Lücke oder Fehlverhalten>
-- Required change: <konkrete, umsetzbare Änderung>
-- Verification: <Test oder überprüfbares Akzeptanzkriterium>
+Bei `approved`: Gib im Feld `output` eine kurze Begründung aus und lasse `handoff` weg.
+Bei `changes_requested`: Gib in `output` nur eine kurze Zusammenfassung aus. Liefere alle blockierenden Befunde zusätzlich und vollständig als strukturiertes JSON im Feld `handoff`:
+`{"kind":"review","findings":[{"title":"...","location":"Datei:Zeile oder Symbol","problem":"konkrete Lücke","required_change":"konkrete Änderung","verification":"Test oder überprüfbares Akzeptanzkriterium"}]}`
 
-Nenne alle blockierenden Befunde; verweise nicht auf deine Run-Datei 
-und setze nicht voraus, dass der Coder sie liest. Sei präzise und knapp. 
-Liefere als Outcome ausschließlich `approved` oder `changes_requested`.
+Jedes Finding muss alle fünf Felder als nicht-leere Strings enthalten. Nenne sämtliche blockierenden Befunde; verweise weder im Handoff noch im Output auf deine private Run-Datei und setze nicht voraus, dass der Coder sie liest. Sei präzise und knapp. Liefere als Outcome ausschließlich `approved` oder `changes_requested`.
 '''

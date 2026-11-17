@@ -81,7 +81,8 @@ impl ShellRunnerAdapter {
 
         let stdout = join_reader(stdout_reader, &step.id)?;
         let stderr = join_reader(stderr_reader, &step.id)?;
-        let output = format_output(&stdout, &stderr);
+        let output =
+            redact_known_secrets(format_output(&stdout, &stderr), &self.config.environment);
         match status {
             Some(status) => Ok(exit_output(status, output)),
             None => Ok(StepOutput {
@@ -91,6 +92,8 @@ impl ShellRunnerAdapter {
                     self.config.timeout
                 ),
                 exit_code: None,
+                attempts: 1,
+                handoff: None,
             }),
         }
     }
@@ -135,6 +138,22 @@ fn format_output(stdout: &[u8], stderr: &[u8]) -> String {
     }
 }
 
+fn redact_known_secrets(output: String, environment: &HashMap<OsString, OsString>) -> String {
+    environment.iter().fold(output, |output, (key, value)| {
+        let key = key.to_string_lossy().to_ascii_uppercase();
+        let value = value.to_string_lossy();
+        if value.len() >= 4
+            && ["TOKEN", "KEY", "SECRET", "PASSWORD"]
+                .iter()
+                .any(|marker| key.contains(marker))
+        {
+            output.replace(value.as_ref(), "[REDACTED]")
+        } else {
+            output
+        }
+    })
+}
+
 fn exit_output(status: ExitStatus, output: String) -> StepOutput {
     let exit_code = status.code();
     StepOutput {
@@ -146,6 +165,8 @@ fn exit_output(status: ExitStatus, output: String) -> StepOutput {
         .into(),
         output,
         exit_code,
+        attempts: 1,
+        handoff: None,
     }
 }
 
@@ -185,6 +206,22 @@ mod tests {
         assert_eq!(output.outcome, "failure");
         assert_eq!(output.exit_code, Some(7));
         assert_eq!(output.output, format!("{}:controlled", directory.display()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn redacts_sensitive_environment_values_from_step_output() {
+        let mut config = ShellRunnerConfig::new(".", Duration::from_secs(2));
+        config
+            .environment
+            .insert("GH_TOKEN".into(), "sensitive-test-token".into());
+        let mut runner = ShellRunnerAdapter::new(config);
+        let output = runner
+            .run(&shell_step("sh", &["-c", "printf '%s' \"$GH_TOKEN\""]))
+            .unwrap();
+        assert_eq!(output.outcome, "success");
+        assert_eq!(output.output, "[REDACTED]");
+        assert!(!output.output.contains("sensitive-test-token"));
     }
 
     #[cfg(unix)]
