@@ -2,19 +2,24 @@
 
 use std::{
     collections::HashMap,
-    io::Read,
-    path::PathBuf,
+    fs::OpenOptions,
+    io::{Read, Write},
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
 
-use factory_core::{AgentDefinition, Step, StepKind, ThinkingLevel, features::StepOutput};
+use factory_core::{
+    AgentDefinition, Step, StepKind, ThinkingLevel,
+    features::{StepOutput, StepResult},
+};
 use serde_json::Value;
 
 use crate::agent::AgentExecutor;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const MAX_HANDOFF_CHARS: usize = 8_000;
 
 /// Executes each agent step in a separate Pi process, reusing that agent's run memory.
 pub struct PiAgentExecutor {
@@ -45,7 +50,12 @@ impl PiAgentExecutor {
 }
 
 impl AgentExecutor for PiAgentExecutor {
-    fn execute(&mut self, agent: &AgentDefinition, step: &Step) -> Result<StepOutput, String> {
+    fn execute(
+        &mut self,
+        agent: &AgentDefinition,
+        step: &Step,
+        previous_result: Option<&StepResult>,
+    ) -> Result<StepOutput, String> {
         if agent.harness != "pi" {
             return Err(format!(
                 "unsupported harness `{}` for agent `{}`",
@@ -72,12 +82,14 @@ impl AgentExecutor for PiAgentExecutor {
                 memory.display()
             ));
         }
+        let handoff = record_handoff(memory, &step.id, previous_result)?;
         let prompt = format!(
-            "{}\n\nFactory pipeline step: `{}` (agent `{}`). Read the run context at `{}` before acting and update that same file with your findings and decisions.\n\nWhen finished, your final response MUST be exactly one JSON object with string keys `outcome` and `output`, for example {{\"outcome\":\"success\",\"output\":\"Implemented changes\"}}. Do not wrap it in markdown. Allowed outcomes for this agent are: {}.",
+            "{}\n\nFactory pipeline step: `{}` (agent `{}`). Read the run context at `{}` before acting and update that same file with your findings and decisions.\n\n{}\n\nWhen finished, your final response MUST be exactly one JSON object with string keys `outcome` and `output`, for example {{\"outcome\":\"success\",\"output\":\"Implemented changes\"}}. Do not wrap it in markdown. Allowed outcomes for this agent are: {}.",
             agent.prompt,
             step.id,
             agent.name,
             memory.display(),
+            handoff,
             allowed_outcomes(&agent.name).join(", ")
         );
         let mut command = Command::new(&self.executable);
@@ -174,6 +186,41 @@ impl AgentExecutor for PiAgentExecutor {
             exit_code: status.code(),
         })
     }
+}
+
+fn record_handoff(
+    memory: &Path,
+    receiving_step: &str,
+    previous_result: Option<&StepResult>,
+) -> Result<String, String> {
+    let Some(previous) = previous_result else {
+        return Ok("No previous pipeline-step result.".into());
+    };
+    let output = previous
+        .output
+        .chars()
+        .take(MAX_HANDOFF_CHARS)
+        .collect::<String>();
+    let truncated = previous.output.chars().count() > MAX_HANDOFF_CHARS;
+    let handoff = format!(
+        "Previous pipeline-step result (step `{}`, outcome `{}`, exit code {:?}):\n{}{}\nTreat this as required handoff context. Address its findings or failures before repeating work.",
+        previous.step_id,
+        previous.outcome,
+        previous.exit_code,
+        output,
+        if truncated {
+            "\n[output truncated]"
+        } else {
+            ""
+        }
+    );
+    let section = format!("\n\n## Handoff before step `{receiving_step}`\n\n{handoff}\n");
+    OpenOptions::new()
+        .append(true)
+        .open(memory)
+        .and_then(|mut file| file.write_all(section.as_bytes()))
+        .map_err(|error| format!("could not append previous step result to run memory: {error}"))?;
+    Ok(handoff)
 }
 
 struct AgentResponse {
@@ -338,7 +385,19 @@ mod tests {
             },
             transitions: vec![],
         };
-        assert_eq!(executor.execute(&agent, &step).unwrap().outcome, "success");
+        let previous = StepResult {
+            step_id: "review".into(),
+            outcome: "changes_requested".into(),
+            output: "Add tests for persisted resume behavior".into(),
+            exit_code: None,
+        };
+        assert_eq!(
+            executor
+                .execute(&agent, &step, Some(&previous))
+                .unwrap()
+                .outcome,
+            "success"
+        );
         let args = std::fs::read_to_string(capture).unwrap();
         assert!(args.contains("provider/model-x"));
         assert!(args.contains("--no-skills"));
@@ -347,6 +406,11 @@ mod tests {
         assert!(args.contains("implement"));
         assert!(args.contains("Do the task"));
         assert!(args.contains(memory.to_str().unwrap()));
+        assert!(args.contains("changes_requested"));
+        assert!(args.contains("Add tests for persisted resume behavior"));
+        let saved_memory = std::fs::read_to_string(&memory).unwrap();
+        assert!(saved_memory.contains("Handoff before step `implement`"));
+        assert!(saved_memory.contains("Add tests for persisted resume behavior"));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -370,7 +434,7 @@ mod tests {
         };
         assert!(
             executor
-                .execute(&agent, &step)
+                .execute(&agent, &step, None)
                 .unwrap_err()
                 .contains("no run memory")
         );

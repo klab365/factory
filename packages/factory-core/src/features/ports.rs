@@ -2,6 +2,8 @@
 
 use crate::{AgentDefinition, Step};
 
+use super::run::StepResult;
+
 /// A structured result returned by a step runner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepOutput {
@@ -12,7 +14,13 @@ pub struct StepOutput {
 
 /// Port for executing an agent step. Implementations belong in adapters.
 pub trait AgentRunner {
-    fn run(&mut self, agent: &AgentDefinition, step: &Step) -> Result<StepOutput, String>;
+    /// Executes an agent step with the immediately preceding pipeline result, if any.
+    fn run(
+        &mut self,
+        agent: &AgentDefinition,
+        step: &Step,
+        previous_result: Option<&StepResult>,
+    ) -> Result<StepOutput, String>;
 }
 
 /// Port for executing a shell step. Implementations belong in adapters.

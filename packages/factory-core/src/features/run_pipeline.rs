@@ -102,7 +102,7 @@ pub fn run_pipeline<A: AgentRunner, S: ShellRunner>(
                         agent: agent.clone(),
                     }
                 })?;
-                agent_runner.run(definition, step)
+                agent_runner.run(definition, step, results.last())
             }
             StepKind::Shell { .. } => shell_runner.run(step),
         }
@@ -163,12 +163,15 @@ mod tests {
     use crate::{ModelRef, StepKind, Transition};
     use std::collections::VecDeque;
 
-    struct FakeRunner(VecDeque<Result<StepOutput, String>>);
+    struct FakeRunner {
+        outputs: VecDeque<Result<StepOutput, String>>,
+        previous_results: Vec<Option<StepResult>>,
+    }
 
     impl FakeRunner {
         fn with(outcomes: &[&str]) -> Self {
-            Self(
-                outcomes
+            Self {
+                outputs: outcomes
                     .iter()
                     .map(|outcome| {
                         Ok(StepOutput {
@@ -178,22 +181,32 @@ mod tests {
                         })
                     })
                     .collect(),
-            )
+                previous_results: Vec::new(),
+            }
         }
 
         fn failure(message: &str) -> Self {
-            Self(VecDeque::from([Err(message.into())]))
+            Self {
+                outputs: VecDeque::from([Err(message.into())]),
+                previous_results: Vec::new(),
+            }
         }
 
         fn next(&mut self) -> Result<StepOutput, String> {
-            self.0
+            self.outputs
                 .pop_front()
                 .unwrap_or_else(|| Err("no fake result".into()))
         }
     }
 
     impl AgentRunner for FakeRunner {
-        fn run(&mut self, _: &AgentDefinition, _: &Step) -> Result<StepOutput, String> {
+        fn run(
+            &mut self,
+            _: &AgentDefinition,
+            _: &Step,
+            previous_result: Option<&StepResult>,
+        ) -> Result<StepOutput, String> {
+            self.previous_results.push(previous_result.cloned());
             self.next()
         }
     }
@@ -288,6 +301,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["build", "review", "build", "review", "finish"]
         );
+        let reviewer_feedback = agents.previous_results[2].as_ref().unwrap();
+        assert_eq!(reviewer_feedback.step_id, "review");
+        assert_eq!(reviewer_feedback.outcome, "changes_requested");
+        assert_eq!(reviewer_feedback.output, "output-changes_requested");
     }
 
     #[test]
