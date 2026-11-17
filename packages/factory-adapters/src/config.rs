@@ -10,7 +10,7 @@ use std::{
 };
 
 use factory_core::{
-    AgentDefinition, ModelRef, Pipeline, Step, StepKind, ThinkingLevel, Transition,
+    AgentDefinition, ModelRef, Pipeline, PipelineInput, Step, StepKind, ThinkingLevel, Transition,
 };
 use serde::{Deserialize, Serialize};
 
@@ -226,6 +226,14 @@ fn thinking_level_name(level: ThinkingLevel) -> &'static str {
 fn pipeline_to_dto(pipeline: &Pipeline) -> PipelineDto {
     PipelineDto {
         name: pipeline.name.clone(),
+        inputs: pipeline
+            .inputs
+            .iter()
+            .map(|input| InputDto {
+                key: input.key.clone(),
+                description: input.description.clone(),
+            })
+            .collect(),
         steps: pipeline
             .steps
             .iter()
@@ -353,7 +361,15 @@ fn parse_thinking_level(value: &str) -> Option<ThinkingLevel> {
 #[derive(Serialize, Deserialize)]
 struct PipelineDto {
     name: String,
+    #[serde(default)]
+    inputs: Vec<InputDto>,
     steps: Vec<StepDto>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct InputDto {
+    key: String,
+    description: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -388,6 +404,46 @@ fn validate_pipeline(
 ) -> Result<Pipeline, ConfigError> {
     if dto.name.trim().is_empty() {
         return Err(invalid(path, "field `name` must not be empty"));
+    }
+    let mut input_names = HashSet::new();
+    let mut inputs = Vec::with_capacity(dto.inputs.len());
+    for input in dto.inputs {
+        if input.key.trim().is_empty()
+            || !input
+                .key
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            return Err(invalid(
+                path,
+                format!(
+                    "pipeline `{}` has invalid input key `{}`",
+                    dto.name, input.key
+                ),
+            ));
+        }
+        if input.description.trim().is_empty() {
+            return Err(invalid(
+                path,
+                format!(
+                    "pipeline `{}` input `{}` needs a description",
+                    dto.name, input.key
+                ),
+            ));
+        }
+        if !input_names.insert(input.key.clone()) {
+            return Err(invalid(
+                path,
+                format!(
+                    "pipeline `{}` has duplicate input `{}`",
+                    dto.name, input.key
+                ),
+            ));
+        }
+        inputs.push(PipelineInput {
+            key: input.key,
+            description: input.description,
+        });
     }
     if dto.steps.is_empty() {
         return Err(invalid(
@@ -477,6 +533,7 @@ fn validate_pipeline(
 
     Ok(Pipeline {
         name: dto.name,
+        inputs,
         steps,
     })
 }
@@ -531,11 +588,12 @@ mod tests {
     fn loads_agent_and_pipeline_into_core_types() {
         let project = TempProject::new();
         project.file(".factory/agents/coder.toml", AGENT);
-        project.file(".factory/pipelines/feature.toml", "name = 'feature'\n\n[[steps]]\nid = 'build'\ntype = 'agent'\nagent = 'coder'\n\n[[steps.transitions]]\noutcome = 'success'\ntarget_step = 'test'\n\n[[steps]]\nid = 'test'\ntype = 'shell'\ncommand = 'cargo'\nargs = ['test']\n");
+        project.file(".factory/pipelines/feature.toml", "name = 'feature'\n[[inputs]]\nkey = 'target'\ndescription = 'The target value'\n\n[[steps]]\nid = 'build'\ntype = 'agent'\nagent = 'coder'\n\n[[steps.transitions]]\noutcome = 'success'\ntarget_step = 'test'\n\n[[steps]]\nid = 'test'\ntype = 'shell'\ncommand = 'cargo'\nargs = ['test']\n");
 
         let config = load_configuration(&project.0).unwrap();
         assert_eq!(config.agents[0].name, "coder");
         assert_eq!(config.agents[0].thinking_level, Some(ThinkingLevel::High));
+        assert_eq!(config.pipelines[0].inputs[0].key, "target");
         assert_eq!(
             config.pipelines[0].steps[0].kind,
             StepKind::Agent {

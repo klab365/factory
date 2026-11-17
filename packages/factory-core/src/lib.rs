@@ -8,4 +8,4 @@ pub mod features;
 pub mod pipeline;
 
 pub use agent::{AgentDefinition, ModelRef, ModelRefParseError, ThinkingLevel};
-pub use pipeline::{Pipeline, Step, StepKind, Transition};
+pub use pipeline::{Pipeline, PipelineInput, Step, StepKind, Transition};

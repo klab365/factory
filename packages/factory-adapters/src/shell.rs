@@ -21,6 +21,8 @@ pub struct ShellRunnerConfig {
     pub timeout: Duration,
     /// The only environment variables made available to child processes.
     pub environment: HashMap<OsString, OsString>,
+    /// Pipeline inputs substituted in shell arguments using `{{name}}` placeholders.
+    pub inputs: HashMap<String, String>,
 }
 
 impl ShellRunnerConfig {
@@ -29,6 +31,7 @@ impl ShellRunnerConfig {
             working_directory: working_directory.into(),
             timeout,
             environment: HashMap::new(),
+            inputs: HashMap::new(),
         }
     }
 }
@@ -43,8 +46,12 @@ impl ShellRunnerAdapter {
     }
 
     fn execute(&self, step: &Step, command: &str, args: &[String]) -> Result<StepOutput, String> {
+        let resolved_args = args
+            .iter()
+            .map(|arg| substitute_inputs(arg, &self.config.inputs, &step.id))
+            .collect::<Result<Vec<_>, _>>()?;
         let mut child = Command::new(command)
-            .args(args)
+            .args(&resolved_args)
             .current_dir(&self.config.working_directory)
             .env_clear()
             .envs(&self.config.environment)
@@ -109,6 +116,32 @@ impl ShellRunner for ShellRunnerAdapter {
             )),
         }
     }
+}
+
+fn substitute_inputs(
+    argument: &str,
+    inputs: &HashMap<String, String>,
+    step_id: &str,
+) -> Result<String, String> {
+    let mut result = String::with_capacity(argument.len());
+    let mut remainder = argument;
+    while let Some(start) = remainder.find("{{") {
+        result.push_str(&remainder[..start]);
+        let value_start = start + 2;
+        let Some(end) = remainder[value_start..].find("}}") else {
+            return Err(format!(
+                "shell step `{step_id}` has an unterminated input placeholder"
+            ));
+        };
+        let name = &remainder[value_start..value_start + end];
+        let value = inputs.get(name).ok_or_else(|| {
+            format!("shell step `{step_id}` references missing pipeline input `{name}`")
+        })?;
+        result.push_str(value);
+        remainder = &remainder[value_start + end + 2..];
+    }
+    result.push_str(remainder);
+    Ok(result)
 }
 
 fn read_all(mut reader: impl Read) -> std::io::Result<Vec<u8>> {
@@ -206,6 +239,71 @@ mod tests {
         assert_eq!(output.outcome, "failure");
         assert_eq!(output.exit_code, Some(7));
         assert_eq!(output.output, format!("{}:controlled", directory.display()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expands_pipeline_input_as_a_single_safe_process_argument() {
+        let directory =
+            std::env::temp_dir().join(format!("factory-shell-arg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let marker = directory.join("injected");
+        let mut config = ShellRunnerConfig::new(&directory, Duration::from_secs(2));
+        config.inputs.insert(
+            "target".into(),
+            format!("https://example.test/a; touch {}", marker.display()),
+        );
+        let mut runner = ShellRunnerAdapter::new(config);
+        let output = runner
+            .run(&shell_step(
+                "sh",
+                &["-c", "printf '%s' \"$1\"", "sh", "{{target}}"],
+            ))
+            .unwrap();
+        assert_eq!(output.outcome, "success");
+        assert!(output.output.contains("; touch"));
+        assert!(!marker.exists());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invokes_fake_command_with_pipeline_input_as_a_separate_argument() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory =
+            std::env::temp_dir().join(format!("factory-fake-gh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let executable = directory.join("gh");
+        std::fs::write(&executable, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let target = "https://github.com/a/b/issues/8; $(echo unsafe)";
+        let mut config = ShellRunnerConfig::new(&directory, Duration::from_secs(2));
+        config
+            .environment
+            .insert("PATH".into(), directory.as_os_str().into());
+        config.inputs.insert("target".into(), target.into());
+        let mut runner = ShellRunnerAdapter::new(config);
+        let step = shell_step(
+            "gh",
+            &[
+                "issue",
+                "view",
+                "{{target}}",
+                "--json",
+                "url,title,body,labels",
+            ],
+        );
+        let output = runner.run(&step).unwrap();
+        assert_eq!(output.outcome, "success");
+        assert_eq!(
+            output.output,
+            format!("issue\nview\n{target}\n--json\nurl,title,body,labels\n")
+        );
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[cfg(unix)]
