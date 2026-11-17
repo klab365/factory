@@ -10,7 +10,7 @@ use std::{
 use factory_core::{
     AgentDefinition, ModelRef, Pipeline, Step, StepKind, ThinkingLevel, Transition,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Configuration {
@@ -63,6 +63,75 @@ pub fn load_configuration(root: impl AsRef<Path>) -> Result<Configuration, Confi
     Ok(Configuration { agents, pipelines })
 }
 
+/// Writes a JSON snapshot of a validated configuration, then reloads it from disk.
+/// The returned value is the one callers should use for the remainder of the run.
+pub fn write_and_load_snapshot(
+    configuration: &Configuration,
+    path: impl AsRef<Path>,
+) -> Result<Configuration, ConfigError> {
+    let path = path.as_ref();
+    let snapshot = ConfigSnapshotDto {
+        version: 1,
+        agents: configuration.agents.iter().map(agent_to_snapshot).collect(),
+        pipelines: configuration
+            .pipelines
+            .iter()
+            .map(pipeline_to_dto)
+            .collect(),
+    };
+    let json = serde_json::to_vec_pretty(&snapshot).map_err(|error| ConfigError {
+        path: path.to_owned(),
+        message: format!("could not serialize configuration snapshot: {error}"),
+    })?;
+    fs::write(path, json).map_err(|error| ConfigError {
+        path: path.to_owned(),
+        message: format!("could not write configuration snapshot: {error}"),
+    })?;
+    load_configuration_snapshot(path)
+}
+
+/// Loads and semantically validates a previously written JSON configuration snapshot.
+pub fn load_configuration_snapshot(path: impl AsRef<Path>) -> Result<Configuration, ConfigError> {
+    let path = path.as_ref();
+    let source = fs::read_to_string(path).map_err(|error| ConfigError {
+        path: path.to_owned(),
+        message: format!("could not read configuration snapshot: {error}"),
+    })?;
+    let snapshot: ConfigSnapshotDto =
+        serde_json::from_str(&source).map_err(|error| ConfigError {
+            path: path.to_owned(),
+            message: format!("invalid JSON configuration snapshot: {error}"),
+        })?;
+    if snapshot.version != 1 {
+        return Err(invalid(
+            path,
+            format!(
+                "unsupported configuration snapshot version `{}`",
+                snapshot.version
+            ),
+        ));
+    }
+
+    let mut agents = Vec::with_capacity(snapshot.agents.len());
+    let mut agent_names = HashSet::new();
+    for dto in snapshot.agents {
+        let agent = validate_snapshot_agent(dto, path)?;
+        if !agent_names.insert(agent.name.clone()) {
+            return Err(invalid(
+                path,
+                format!("duplicate agent name `{}`", agent.name),
+            ));
+        }
+        agents.push(agent);
+    }
+    let pipelines = snapshot
+        .pipelines
+        .into_iter()
+        .map(|dto| validate_pipeline(dto, path, &agents))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Configuration { agents, pipelines })
+}
+
 fn toml_files(dir: &Path) -> Result<Vec<PathBuf>, ConfigError> {
     let entries = fs::read_dir(dir).map_err(|error| ConfigError {
         path: dir.to_owned(),
@@ -98,6 +167,79 @@ fn parse_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, ConfigErro
     })
 }
 
+#[derive(Serialize, Deserialize)]
+struct ConfigSnapshotDto {
+    version: u32,
+    agents: Vec<AgentSnapshotDto>,
+    pipelines: Vec<PipelineDto>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AgentSnapshotDto {
+    name: String,
+    harness: String,
+    model: String,
+    thinking_level: Option<String>,
+    prompt: String,
+}
+
+fn agent_to_snapshot(agent: &AgentDefinition) -> AgentSnapshotDto {
+    AgentSnapshotDto {
+        name: agent.name.clone(),
+        harness: agent.harness.clone(),
+        model: format!("{}/{}", agent.model.provider, agent.model.model),
+        thinking_level: agent
+            .thinking_level
+            .map(thinking_level_name)
+            .map(str::to_owned),
+        prompt: agent.prompt.clone(),
+    }
+}
+
+fn thinking_level_name(level: ThinkingLevel) -> &'static str {
+    match level {
+        ThinkingLevel::Off => "off",
+        ThinkingLevel::Minimal => "minimal",
+        ThinkingLevel::Low => "low",
+        ThinkingLevel::Medium => "medium",
+        ThinkingLevel::High => "high",
+        ThinkingLevel::XHigh => "xhigh",
+    }
+}
+
+fn pipeline_to_dto(pipeline: &Pipeline) -> PipelineDto {
+    PipelineDto {
+        name: pipeline.name.clone(),
+        steps: pipeline
+            .steps
+            .iter()
+            .map(|step| {
+                let transitions = step
+                    .transitions
+                    .iter()
+                    .map(|transition| TransitionDto {
+                        outcome: transition.outcome.clone(),
+                        target_step: transition.target_step.clone(),
+                    })
+                    .collect();
+                match &step.kind {
+                    StepKind::Agent { agent } => StepDto::Agent {
+                        id: step.id.clone(),
+                        agent: agent.clone(),
+                        transitions,
+                    },
+                    StepKind::Shell { command, args } => StepDto::Shell {
+                        id: step.id.clone(),
+                        command: command.clone(),
+                        args: args.clone(),
+                        transitions,
+                    },
+                }
+            })
+            .collect(),
+    }
+}
+
 #[derive(Deserialize)]
 struct AgentDto {
     name: String,
@@ -108,45 +250,75 @@ struct AgentDto {
 }
 
 fn validate_agent(dto: AgentDto, path: &Path) -> Result<AgentDefinition, ConfigError> {
-    if dto.name.trim().is_empty() {
+    validate_agent_fields(
+        dto.name,
+        dto.harness,
+        dto.model,
+        Some(dto.thinking_level),
+        dto.prompt,
+        path,
+    )
+}
+
+fn validate_snapshot_agent(
+    dto: AgentSnapshotDto,
+    path: &Path,
+) -> Result<AgentDefinition, ConfigError> {
+    validate_agent_fields(
+        dto.name,
+        dto.harness,
+        dto.model,
+        dto.thinking_level,
+        dto.prompt,
+        path,
+    )
+}
+
+fn validate_agent_fields(
+    name: String,
+    harness: String,
+    model_value: String,
+    thinking_value: Option<String>,
+    prompt: String,
+    path: &Path,
+) -> Result<AgentDefinition, ConfigError> {
+    if name.trim().is_empty() {
         return Err(invalid(path, "field `name` must not be empty"));
     }
-    if dto.harness.trim().is_empty() {
+    if harness.trim().is_empty() {
         return Err(invalid(path, "field `harness` must not be empty"));
     }
-    if dto.prompt.trim().is_empty() {
+    if prompt.trim().is_empty() {
         return Err(invalid(
             path,
-            format!("agent `{}` field `prompt` must not be empty", dto.name),
+            format!("agent `{name}` field `prompt` must not be empty"),
         ));
     }
-    let model = ModelRef::parse(&dto.model)
-        .map_err(|error| invalid(path, format!("agent `{}` field `model`: {error}", dto.name)))?;
-    if dto.model.chars().any(char::is_whitespace) {
+    let model = ModelRef::parse(&model_value)
+        .map_err(|error| invalid(path, format!("agent `{name}` field `model`: {error}")))?;
+    if model_value.chars().any(char::is_whitespace) {
         return Err(invalid(
             path,
-            format!(
-                "agent `{}` field `model` must not contain whitespace",
-                dto.name
-            ),
+            format!("agent `{}` field `model` must not contain whitespace", name),
         ));
     }
-    let thinking_level = parse_thinking_level(&dto.thinking_level).ok_or_else(|| {
-        invalid(
-            path,
-            format!(
-                "agent `{}` has invalid field `thinking_level`: `{}`",
-                dto.name, dto.thinking_level
-            ),
-        )
-    })?;
+    let thinking_level = thinking_value
+        .map(|value| {
+            parse_thinking_level(&value).ok_or_else(|| {
+                invalid(
+                    path,
+                    format!("agent `{name}` has invalid field `thinking_level`: `{value}`"),
+                )
+            })
+        })
+        .transpose()?;
 
     Ok(AgentDefinition {
-        name: dto.name,
-        harness: dto.harness,
+        name,
+        harness,
         model,
-        thinking_level: Some(thinking_level),
-        prompt: dto.prompt,
+        thinking_level,
+        prompt,
     })
 }
 
@@ -162,13 +334,13 @@ fn parse_thinking_level(value: &str) -> Option<ThinkingLevel> {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct PipelineDto {
     name: String,
     steps: Vec<StepDto>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum StepDto {
     Agent {
@@ -187,7 +359,7 @@ enum StepDto {
     },
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct TransitionDto {
     outcome: String,
     target_step: String,
@@ -362,6 +534,35 @@ mod tests {
                 command: "cargo".into(),
                 args: vec!["test".into()]
             }
+        );
+    }
+
+    #[test]
+    fn snapshots_configuration_as_json_and_reloads_the_saved_copy() {
+        let project = TempProject::new();
+        let agent_path = project.file(".factory/agents/coder.toml", AGENT);
+        project.file(
+            ".factory/pipelines/feature.toml",
+            "name = 'feature'\n\n[[steps]]\nid = 'build'\ntype = 'agent'\nagent = 'coder'\n",
+        );
+        let original = load_configuration(&project.0).unwrap();
+        let run_dir = project.0.join(".factory/runs/run-1");
+        fs::create_dir_all(&run_dir).unwrap();
+        let snapshot_path = run_dir.join("config.json");
+
+        let snapshot_config = write_and_load_snapshot(&original, &snapshot_path).unwrap();
+        assert_eq!(snapshot_config, original);
+        let json = fs::read_to_string(&snapshot_path).unwrap();
+        assert!(json.contains("\"version\": 1"));
+
+        fs::write(
+            agent_path,
+            AGENT.replace("Implement the task.", "Changed after run start."),
+        )
+        .unwrap();
+        assert_eq!(
+            load_configuration_snapshot(&snapshot_path).unwrap(),
+            original
         );
     }
 

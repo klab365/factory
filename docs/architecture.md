@@ -36,6 +36,8 @@ Eine Agentendefinition enthält mindestens `name`, `harness`, `model`, `thinking
 
 Pipelines definieren Schritte mit explizitem `type = "agent"` oder `type = "shell"`. Agentenschritte referenzieren Agenten per Namen. Übergänge bilden Entscheidungen und Schleifen ab, zum Beispiel Review-Ergebnis `changes_requested` zurück zu `build` oder `approved` weiter zu `commit`.
 
+Unter `.factory/runs/<run-id>/` liegt das run-spezifische Agentengedächtnis: Jeder Agent hält dort im Rahmen seines Runs Kontext, getroffene Entscheidungen, Ergebnisse und offene Punkte fest. Diese Dateien dokumentieren den Verlauf eines einzelnen Runs und ergänzen, statt die projektweite Agenten- und Pipeline-Konfiguration zu ersetzen.
+
 ## Ablauf und Ergebnisse
 
 Der Core sollte keine frei formulierten Agentenantworten selbst als Kontrollfluss interpretieren. Adapter bzw. Application-Schicht liefern strukturierte Ergebnisse und benannte Outcomes; die Pipeline definiert, welches Outcome zu welchem Schritt führt. Schleifen und Wiederholungen müssen begrenzt sein, damit fehlerhafte Konfigurationen keine Endlosschleifen erzeugen.
