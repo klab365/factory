@@ -110,17 +110,7 @@ fn run_new_pipeline(pipeline_name: &str, task: &str, inputs: HashMap<String, Str
             }
         }
     }
-    let task = if task.trim().is_empty() {
-        match prompt_value("Task: ") {
-            Ok(value) => value,
-            Err(error) => {
-                eprintln!("Input error: {error}");
-                return EXIT_USAGE_ERROR;
-            }
-        }
-    } else {
-        task.to_owned()
-    };
+    let task = task_for_run(task, &inputs);
     if let Err(error) = validate_pipeline_inputs(source_pipeline, &inputs) {
         eprintln!("Input error: {error}");
         return EXIT_USAGE_ERROR;
@@ -468,6 +458,22 @@ fn prompt_value(prompt: &str) -> Result<String, String> {
     Ok(value)
 }
 
+fn task_for_run(task: &str, inputs: &HashMap<String, String>) -> String {
+    if !task.trim().is_empty() {
+        return task.to_owned();
+    }
+    if let Some(task) = inputs.get("task") {
+        return task.clone();
+    }
+    let mut entries: Vec<_> = inputs.iter().collect();
+    entries.sort_by_key(|(key, _)| *key);
+    entries
+        .into_iter()
+        .map(|(key, value)| format!("{key}: {value}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn validate_pipeline_inputs(
     pipeline: &Pipeline,
     values: &HashMap<String, String>,
@@ -611,6 +617,21 @@ mod tests {
     }
 
     #[test]
+    fn derives_run_task_from_pipeline_inputs_without_prompting_for_task() {
+        let inputs =
+            HashMap::from([("issue_url".into(), "https://github.com/o/r/issues/1".into())]);
+        assert_eq!(
+            task_for_run("", &inputs),
+            "issue_url: https://github.com/o/r/issues/1"
+        );
+        assert_eq!(task_for_run("Explicit task", &inputs), "Explicit task");
+        assert_eq!(
+            task_for_run("", &HashMap::from([("task".into(), "Do it".into())])),
+            "Do it"
+        );
+    }
+
+    #[test]
     fn accepts_pipeline_name_without_task_and_rejects_missing_input_values() {
         assert_eq!(run_cli(&[]), EXIT_USAGE_ERROR);
         assert_eq!(
@@ -641,7 +662,10 @@ mod tests {
         let second_marker = root.join("second-ran");
         let pipeline = Pipeline {
             name: "resume-test".into(),
-            inputs: vec![],
+            inputs: vec![factory_core::PipelineInput {
+                key: "task".into(),
+                description: "Task to run".into(),
+            }],
             steps: vec![
                 Step {
                     id: "first".into(),
@@ -674,7 +698,7 @@ mod tests {
             "resume-test".into(),
             "resume-test".into(),
             "test task".into(),
-            HashMap::new(),
+            HashMap::from([("task".into(), "test task".into())]),
         )
         .unwrap();
         store.step_started("first").unwrap();
