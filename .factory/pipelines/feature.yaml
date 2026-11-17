@@ -2,6 +2,7 @@ name: feature
 inputs:
   - key: issue_url
     description: GitHub issue URL in the form https://github.com/owner/repo/issues/123
+
 steps:
   - id: issue-intake
     type: shell
@@ -10,12 +11,14 @@ steps:
     transitions:
       - outcome: success
         target_step: planner
+
   - id: planner
     type: agent
     agent: planner
     transitions:
       - outcome: success
         target_step: build
+
   - id: build
     type: agent
     agent: coder
@@ -24,6 +27,7 @@ steps:
         target_step: review
       - outcome: failure
         target_step: review
+
   - id: review
     type: agent
     agent: reviewer
@@ -32,6 +36,7 @@ steps:
         target_step: build
       - outcome: approved
         target_step: test
+
   - id: test
     type: shell
     command: mise

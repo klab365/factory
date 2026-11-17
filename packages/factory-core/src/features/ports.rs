@@ -36,4 +36,9 @@ pub trait RunJournal {
     fn step_started(&mut self, step_id: &str) -> Result<(), String>;
     fn step_completed(&mut self, result: &StepResult) -> Result<(), String>;
     fn step_failed(&mut self, step_id: &str, error: &str) -> Result<(), String>;
+
+    /// Called when a reviewer repeats an identical structured rejection. Return false to stop.
+    fn confirm_repeated_review_feedback(&mut self, _result: &StepResult) -> Result<bool, String> {
+        Ok(true)
+    }
 }

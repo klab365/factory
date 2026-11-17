@@ -4,6 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
     fs,
+    io::{self, IsTerminal, Write},
     path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -522,7 +523,13 @@ impl<'a> ConsoleRunJournal<'a> {
 impl RunJournal for ConsoleRunJournal<'_> {
     fn step_started(&mut self, step_id: &str) -> Result<(), String> {
         self.store.step_started(step_id)?;
-        println!("Starting step `{step_id}`");
+        let record = self.store.record();
+        let step = record.steps.last().expect("step was just recorded");
+        println!(
+            "Starting step `{step_id}` (Step {}/{MAX_STEP_EXECUTIONS}, attempt {})",
+            record.steps.len(),
+            step.attempt
+        );
         Ok(())
     }
 
@@ -536,6 +543,30 @@ impl RunJournal for ConsoleRunJournal<'_> {
         self.store.step_failed(step_id, error)?;
         eprintln!("Step `{step_id}` execution error: {error}");
         Ok(())
+    }
+
+    fn confirm_repeated_review_feedback(&mut self, result: &StepResult) -> Result<bool, String> {
+        eprintln!(
+            "Warning: identical reviewer feedback has occurred again on `{}`.",
+            result.step_id
+        );
+        if !io::stdin().is_terminal() {
+            eprintln!(
+                "Non-interactive input: stopping safely. After addressing the feedback, continue with `factory run resume {} --retry-current`.",
+                self.store.record().run_id
+            );
+            return Ok(false);
+        }
+        eprint!("Continue review loop? [y/N] ");
+        io::stderr().flush().map_err(|error| error.to_string())?;
+        let mut answer = String::new();
+        io::stdin()
+            .read_line(&mut answer)
+            .map_err(|error| error.to_string())?;
+        Ok(matches!(
+            answer.trim().to_ascii_lowercase().as_str(),
+            "y" | "yes"
+        ))
     }
 }
 
@@ -712,9 +743,13 @@ mod tests {
                 handoff: None,
             })
             .unwrap();
-        store.mark_interrupted().unwrap();
+        store.finish(PersistedRunStatus::Failed).unwrap();
 
-        assert_eq!(resume_run(&root, &run_dir, &mut store, false), EXIT_SUCCESS);
+        assert_eq!(
+            resume_run(&root, &run_dir, &mut store, false),
+            EXIT_USAGE_ERROR
+        );
+        assert_eq!(resume_run(&root, &run_dir, &mut store, true), EXIT_SUCCESS);
         assert!(!first_marker.exists(), "completed shell step was rerun");
         assert!(second_marker.exists(), "next shell step did not run");
         assert_eq!(store.record().status, PersistedRunStatus::Succeeded);
