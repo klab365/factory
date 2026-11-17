@@ -30,17 +30,50 @@ const SHELL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Runs the CLI for arguments after the executable name and returns its process exit code.
 pub fn run_cli(args: &[String]) -> u8 {
-    if args.first().is_some_and(|arg| arg == "run") {
-        return run_management_command(args);
-    }
-    if args.len() < 2 {
-        eprintln!("Usage: factory <pipeline-name> <task> | factory run <show|resume> <run-id>");
+    let pipeline_args = if args.first().is_some_and(|arg| arg == "run") {
+        if matches!(args.get(1).map(String::as_str), Some("show" | "resume")) {
+            return run_management_command(args);
+        }
+        if args.len() < 2 {
+            eprintln!("Usage: factory run <pipeline-name> [--input name=value]... [task]");
+            return EXIT_USAGE_ERROR;
+        }
+        &args[1..]
+    } else {
+        args
+    };
+    if pipeline_args.is_empty() {
+        eprintln!("Usage: factory <pipeline-name> [--input name=value]... [task]");
         return EXIT_USAGE_ERROR;
     }
-    run_new_pipeline(&args[0], &args[1..].join(" "))
+    let pipeline_name = &pipeline_args[0];
+    let mut task_parts = Vec::new();
+    let mut inputs = HashMap::new();
+    let mut index = 1;
+    while index < pipeline_args.len() {
+        if pipeline_args[index] == "--input" {
+            let Some(pair) = pipeline_args.get(index + 1) else {
+                eprintln!("Usage error: `--input` requires name=value");
+                return EXIT_USAGE_ERROR;
+            };
+            let Some((name, value)) = pair.split_once('=') else {
+                eprintln!("Usage error: input must use name=value");
+                return EXIT_USAGE_ERROR;
+            };
+            if name.is_empty() || inputs.insert(name.to_owned(), value.to_owned()).is_some() {
+                eprintln!("Usage error: input names must be non-empty and unique");
+                return EXIT_USAGE_ERROR;
+            }
+            index += 2;
+        } else {
+            task_parts.push(pipeline_args[index].as_str());
+            index += 1;
+        }
+    }
+    run_new_pipeline(pipeline_name, &task_parts.join(" "), inputs)
 }
 
-fn run_new_pipeline(pipeline_name: &str, task: &str) -> u8 {
+fn run_new_pipeline(pipeline_name: &str, task: &str, inputs: HashMap<String, String>) -> u8 {
     let root = match std::env::current_dir() {
         Ok(root) => root,
         Err(error) => {
@@ -55,6 +88,43 @@ fn run_new_pipeline(pipeline_name: &str, task: &str) -> u8 {
             return EXIT_CONFIGURATION_ERROR;
         }
     };
+    let Some(source_pipeline) = source_configuration
+        .pipelines
+        .iter()
+        .find(|pipeline| pipeline.name == pipeline_name)
+    else {
+        eprintln!("Configuration error: pipeline `{pipeline_name}` was not found");
+        return EXIT_CONFIGURATION_ERROR;
+    };
+    let mut inputs = inputs;
+    for input in &source_pipeline.inputs {
+        if !inputs.contains_key(&input.key) {
+            match prompt_value(&format!("{} ({}): ", input.key, input.description)) {
+                Ok(value) => {
+                    inputs.insert(input.key.clone(), value);
+                }
+                Err(error) => {
+                    eprintln!("Input error: {error}");
+                    return EXIT_USAGE_ERROR;
+                }
+            }
+        }
+    }
+    let task = if task.trim().is_empty() {
+        match prompt_value("Task: ") {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("Input error: {error}");
+                return EXIT_USAGE_ERROR;
+            }
+        }
+    } else {
+        task.to_owned()
+    };
+    if let Err(error) = validate_pipeline_inputs(source_pipeline, &inputs) {
+        eprintln!("Input error: {error}");
+        return EXIT_USAGE_ERROR;
+    }
     let run_dir = match create_run_dir(&root) {
         Ok(path) => path,
         Err(error) => {
@@ -71,7 +141,8 @@ fn run_new_pipeline(pipeline_name: &str, task: &str) -> u8 {
         &run_dir,
         run_id.clone(),
         pipeline_name.to_owned(),
-        task.to_owned(),
+        task.clone(),
+        inputs.clone(),
     ) {
         Ok(store) => store,
         Err(error) => {
@@ -95,8 +166,12 @@ fn run_new_pipeline(pipeline_name: &str, task: &str) -> u8 {
         eprintln!("Configuration error: pipeline `{pipeline_name}` was not found in snapshot");
         return fail_run(&mut store, EXIT_CONFIGURATION_ERROR);
     };
+    if let Err(error) = validate_pipeline_inputs(pipeline, &inputs) {
+        eprintln!("Input error: {error}");
+        return fail_run(&mut store, EXIT_USAGE_ERROR);
+    }
     let memory_paths =
-        match initialize_agent_memories(&run_dir, pipeline, &configuration.agents, task) {
+        match initialize_agent_memories(&run_dir, pipeline, &configuration.agents, &task) {
             Ok(paths) => paths,
             Err(error) => {
                 eprintln!("Could not initialize run memory: {error}");
@@ -111,7 +186,7 @@ fn run_new_pipeline(pipeline_name: &str, task: &str) -> u8 {
         println!("Agent memory: {}", path.display());
     }
     let mut agent_runner = AgentRunnerAdapter::new(PiAgentExecutor::new(memory_paths));
-    let mut shell_runner = ShellRunnerAdapter::new(shell_config(&root));
+    let mut shell_runner = ShellRunnerAdapter::new(shell_config(&root, inputs));
     let result = {
         let mut journal = ConsoleRunJournal::new(&mut store);
         run_pipeline_with_journal(
@@ -232,6 +307,10 @@ fn resume_run(
         );
         return EXIT_CONFIGURATION_ERROR;
     };
+    if let Err(error) = validate_pipeline_inputs(pipeline, &store.record().inputs) {
+        eprintln!("Saved run input error: {error}");
+        return EXIT_CONFIGURATION_ERROR;
+    }
     let memory_paths = match initialize_agent_memories(
         run_dir,
         pipeline,
@@ -246,7 +325,8 @@ fn resume_run(
     };
     println!("Resuming run `{}`", store.record().run_id);
     let mut agent_runner = AgentRunnerAdapter::new(PiAgentExecutor::new(memory_paths));
-    let mut shell_runner = ShellRunnerAdapter::new(shell_config(root));
+    let mut shell_runner =
+        ShellRunnerAdapter::new(shell_config(root, store.record().inputs.clone()));
     let completed = store.completed_results();
     let result = {
         let mut journal = ConsoleRunJournal::new(store);
@@ -367,8 +447,53 @@ fn initialize_agent_memories(
     Ok(memories)
 }
 
-fn shell_config(root: &std::path::Path) -> ShellRunnerConfig {
+fn prompt_value(prompt: &str) -> Result<String, String> {
+    use std::io::{self, Write};
+
+    print!("{prompt}");
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("could not display prompt: {error}"))?;
+    let mut value = String::new();
+    let bytes = io::stdin()
+        .read_line(&mut value)
+        .map_err(|error| format!("could not read input: {error}"))?;
+    if bytes == 0 {
+        return Err("no input received (stdin is closed)".into());
+    }
+    let value = value.trim_end_matches(['\r', '\n']).to_owned();
+    if value.trim().is_empty() {
+        return Err("input must not be empty".into());
+    }
+    Ok(value)
+}
+
+fn validate_pipeline_inputs(
+    pipeline: &Pipeline,
+    values: &HashMap<String, String>,
+) -> Result<(), String> {
+    for input in &pipeline.inputs {
+        if !values.contains_key(&input.key) {
+            return Err(format!(
+                "required input `{}` ({}) was not provided",
+                input.key, input.description
+            ));
+        }
+    }
+    for name in values.keys() {
+        if !pipeline.inputs.iter().any(|input| &input.key == name) {
+            return Err(format!(
+                "pipeline `{}` does not declare input `{name}`",
+                pipeline.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn shell_config(root: &std::path::Path, inputs: HashMap<String, String>) -> ShellRunnerConfig {
     let mut config = ShellRunnerConfig::new(root, SHELL_TIMEOUT);
+    config.inputs = inputs;
     // Commands receive only these explicitly selected variables, not the full parent environment.
     for key in ["PATH", "HOME", "TMPDIR", "TMP", "TEMP", "SYSTEMROOT"] {
         if let Some(value) = std::env::var_os(key) {
@@ -442,6 +567,33 @@ mod tests {
     use factory_core::{Step, features::RunError};
 
     #[test]
+    fn validates_declared_pipeline_inputs_generically() {
+        let pipeline = Pipeline {
+            name: "feature".into(),
+            inputs: vec![factory_core::PipelineInput {
+                key: "target".into(),
+                description: "Target input".into(),
+            }],
+            steps: vec![],
+        };
+        assert!(validate_pipeline_inputs(&pipeline, &HashMap::new()).is_err());
+        assert!(
+            validate_pipeline_inputs(
+                &pipeline,
+                &HashMap::from([("target".into(), "value".into())])
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_pipeline_inputs(
+                &pipeline,
+                &HashMap::from([("unknown".into(), "value".into())])
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn distinguishes_terminal_failure_from_execution_errors() {
         let report = RunReport {
             pipeline_name: "review".into(),
@@ -459,9 +611,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_argument_counts() {
+    fn accepts_pipeline_name_without_task_and_rejects_missing_input_values() {
         assert_eq!(run_cli(&[]), EXIT_USAGE_ERROR);
-        assert_eq!(run_cli(&["feature".into()]), EXIT_USAGE_ERROR);
+        assert_eq!(
+            run_cli(&["feature".into(), "--input".into()]),
+            EXIT_USAGE_ERROR
+        );
     }
 
     #[test]
@@ -486,6 +641,7 @@ mod tests {
         let second_marker = root.join("second-ran");
         let pipeline = Pipeline {
             name: "resume-test".into(),
+            inputs: vec![],
             steps: vec![
                 Step {
                     id: "first".into(),
@@ -518,6 +674,7 @@ mod tests {
             "resume-test".into(),
             "resume-test".into(),
             "test task".into(),
+            HashMap::new(),
         )
         .unwrap();
         store.step_started("first").unwrap();
@@ -557,6 +714,7 @@ mod tests {
         let agents = [agent("coder"), agent("reviewer")];
         let pipeline = Pipeline {
             name: "feature".into(),
+            inputs: vec![],
             steps: vec![
                 agent_step("build", "coder"),
                 agent_step("review", "reviewer"),

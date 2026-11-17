@@ -402,6 +402,7 @@ mod tests {
     fn runs_a_linear_pipeline_to_success() {
         let pipeline = Pipeline {
             name: "linear".into(),
+            inputs: vec![],
             steps: vec![
                 agent_step("build", &[("success", "test")]),
                 shell_step("test"),
@@ -425,6 +426,7 @@ mod tests {
     fn resumes_after_saved_steps_without_rerunning_them_and_journals_new_steps() {
         let pipeline = Pipeline {
             name: "resume".into(),
+            inputs: vec![],
             steps: vec![
                 agent_step("build", &[("success", "test")]),
                 shell_step("test"),
@@ -463,6 +465,7 @@ mod tests {
     fn supports_review_return_to_build() {
         let pipeline = Pipeline {
             name: "review".into(),
+            inputs: vec![],
             steps: vec![
                 agent_step("build", &[("success", "review")]),
                 agent_step(
@@ -493,6 +496,7 @@ mod tests {
     fn returns_failed_terminal_status() {
         let pipeline = Pipeline {
             name: "failed".into(),
+            inputs: vec![],
             steps: vec![shell_step("test")],
         };
         let mut agents = FakeRunner::with(&[]);
@@ -505,6 +509,7 @@ mod tests {
     fn reports_runner_errors_and_unknown_outcomes() {
         let pipeline = Pipeline {
             name: "error".into(),
+            inputs: vec![],
             steps: vec![shell_step("test")],
         };
         let mut agents = FakeRunner::with(&[]);
@@ -531,6 +536,7 @@ mod tests {
     fn prevents_unbounded_transition_loops() {
         let pipeline = Pipeline {
             name: "loop".into(),
+            inputs: vec![],
             steps: vec![agent_step("again", &[("again", "again")])],
         };
         let mut agents = FakeRunner::with(&["again", "again"]);

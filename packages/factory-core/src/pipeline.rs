@@ -2,7 +2,14 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pipeline {
     pub name: String,
+    pub inputs: Vec<PipelineInput>,
     pub steps: Vec<Step>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PipelineInput {
+    pub key: String,
+    pub description: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

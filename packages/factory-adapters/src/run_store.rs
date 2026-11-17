@@ -155,6 +155,8 @@ pub struct RunRecord {
     pub run_id: String,
     pub pipeline_name: String,
     pub task: String,
+    #[serde(default)]
+    pub inputs: std::collections::HashMap<String, String>,
     pub config_snapshot: String,
     pub status: PersistedRunStatus,
     pub current_step: Option<String>,
@@ -175,6 +177,7 @@ impl RunStore {
         run_id: String,
         pipeline_name: String,
         task: String,
+        inputs: std::collections::HashMap<String, String>,
     ) -> Result<Self, RunStoreError> {
         let run_dir = run_dir.into();
         let now = now_ms()?;
@@ -185,6 +188,7 @@ impl RunStore {
                 run_id,
                 pipeline_name,
                 task,
+                inputs,
                 config_snapshot: "config.json".into(),
                 status: PersistedRunStatus::Running,
                 current_step: None,
@@ -385,6 +389,7 @@ mod tests {
             "run-error".into(),
             "feature".into(),
             "task".into(),
+            std::collections::HashMap::new(),
         )
         .unwrap();
         store.step_started("build").unwrap();
@@ -414,8 +419,14 @@ mod tests {
             std::env::temp_dir().join(format!("factory-run-store-{}", std::process::id()));
         let _ = fs::remove_dir_all(&run_dir);
         fs::create_dir_all(&run_dir).unwrap();
-        let mut store =
-            RunStore::create(&run_dir, "run-1".into(), "feature".into(), "task".into()).unwrap();
+        let mut store = RunStore::create(
+            &run_dir,
+            "run-1".into(),
+            "feature".into(),
+            "task".into(),
+            std::collections::HashMap::from([("target".into(), "value".into())]),
+        )
+        .unwrap();
         store.step_started("build").unwrap();
         let result = StepResult {
             step_id: "build".into(),
@@ -438,6 +449,7 @@ mod tests {
 
         let store = RunStore::open(&run_dir).unwrap();
         assert_eq!(store.record().status, PersistedRunStatus::Running);
+        assert_eq!(store.record().inputs["target"], "value");
         assert_eq!(store.completed_results(), [result]);
         assert_eq!(store.record().current_step.as_deref(), Some("build"));
         fs::remove_dir_all(run_dir).unwrap();

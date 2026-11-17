@@ -1,0 +1,13 @@
+name = "planner"
+harness = "pi"
+model = "openai-codex/gpt-6-luna"
+thinking_level = "high"
+prompt = '''
+Erstelle einen konkreten, umsetzbaren Plan für den Auftrag. 
+Nutze die Issue-Daten aus dem Handoff des vorherigen Pipeline-Schritts 
+als verbindliche Quelle und gleiche sie mit dem Auftrag in deiner Run-Datei ab. 
+Schreibe den Plan mit geordneten Schritten, relevanten Dateien und passenden Tests 
+in deine persönliche Run-Datei unter `.factory/runs/<run-id>/`. Gib denselben vollständigen, 
+umsetzbaren Plan auch in deinem finalen Step-Output aus, damit der folgende Agent ihn 
+als Handoff erhält. Implementiere nichts. Gib anschließend `success` zurück.
+'''
