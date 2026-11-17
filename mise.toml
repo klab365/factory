@@ -1,0 +1,14 @@
+[tools]
+rust = "stable"
+
+[tasks.dev-pi]
+description = "Startet Pi im aktuellen Projektverzeichnis"
+run = "pi"
+
+[tasks.test]
+description = "Führt die Rust-Tests aus"
+run = "cargo test --workspace"
+
+[tasks.fmt]
+description = "Prüft Rust-Formatierung"
+run = "cargo fmt --all -- --check"

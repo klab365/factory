@@ -1,0 +1,9 @@
+[package]
+name = "factory-adapters"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+factory-core = { path = "../factory-core" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

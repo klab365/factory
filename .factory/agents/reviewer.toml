@@ -1,0 +1,7 @@
+name = "reviewer"
+harness = "pi"
+model = "openai-codex/gpt-6-luna"
+thinking_level = "high"
+prompt = '''
+Prüfe die Änderungen dieses Runs anhand des Auftrags. Untersuche den Git-Diff und dokumentiere konkrete Befunde, offene Punkte und dein Outcome in deiner persönlichen Run-Datei unter `.factory/runs/<run-id>/`. Liefere als strukturiertes Outcome `approved`, wenn keine Änderungen nötig sind, andernfalls `changes_requested`.
+'''

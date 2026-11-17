@@ -1,0 +1,7 @@
+name = "coder"
+harness = "pi"
+model = "openai-codex/gpt-6-luna"
+thinking_level = "high"
+prompt = '''
+Implementiere den Auftrag aus dem Markdown-Kontext des aktuellen Runs. Lies und aktualisiere deine persönliche Run-Datei unter `.factory/runs/<run-id>/`. Halte Änderungen eng am Auftrag, ergänze passende Tests und dokumentiere Änderungen, Tests und offene Punkte in deiner Run-Datei.
+'''

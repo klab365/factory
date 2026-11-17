@@ -1,0 +1,33 @@
+name = "feature"
+
+[[steps]]
+id = "build"
+type = "agent"
+agent = "coder"
+
+[[steps.transitions]]
+outcome = "success"
+target_step = "review"
+
+[[steps.transitions]]
+outcome = "failure"
+target_step = "review"
+
+[[steps]]
+id = "review"
+type = "agent"
+agent = "reviewer"
+
+[[steps.transitions]]
+outcome = "changes_requested"
+target_step = "build"
+
+[[steps.transitions]]
+outcome = "approved"
+target_step = "test"
+
+[[steps]]
+id = "test"
+type = "shell"
+command = "cargo"
+args = ["test", "--workspace"]

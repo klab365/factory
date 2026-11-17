@@ -1,0 +1,202 @@
+//! Explicit shell-command execution adapter with bounded runtime and environment.
+
+use std::{
+    collections::HashMap,
+    ffi::OsString,
+    io::Read,
+    path::PathBuf,
+    process::{Command, ExitStatus, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
+
+use factory_core::{
+    Step, StepKind,
+    features::{ShellRunner, StepOutput},
+};
+
+#[derive(Debug, Clone)]
+pub struct ShellRunnerConfig {
+    pub working_directory: PathBuf,
+    pub timeout: Duration,
+    /// The only environment variables made available to child processes.
+    pub environment: HashMap<OsString, OsString>,
+}
+
+impl ShellRunnerConfig {
+    pub fn new(working_directory: impl Into<PathBuf>, timeout: Duration) -> Self {
+        Self {
+            working_directory: working_directory.into(),
+            timeout,
+            environment: HashMap::new(),
+        }
+    }
+}
+
+pub struct ShellRunnerAdapter {
+    config: ShellRunnerConfig,
+}
+
+impl ShellRunnerAdapter {
+    pub fn new(config: ShellRunnerConfig) -> Self {
+        Self { config }
+    }
+
+    fn execute(&self, step: &Step, command: &str, args: &[String]) -> Result<StepOutput, String> {
+        let mut child = Command::new(command)
+            .args(args)
+            .current_dir(&self.config.working_directory)
+            .env_clear()
+            .envs(&self.config.environment)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("could not start shell step `{}`: {error}", step.id))?;
+
+        let stdout = child.stdout.take().expect("stdout was configured as piped");
+        let stderr = child.stderr.take().expect("stderr was configured as piped");
+        let stdout_reader = thread::spawn(move || read_all(stdout));
+        let stderr_reader = thread::spawn(move || read_all(stderr));
+        let started = Instant::now();
+
+        let status = loop {
+            match child
+                .try_wait()
+                .map_err(|error| format!("could not wait for shell step `{}`: {error}", step.id))?
+            {
+                Some(status) => break Some(status),
+                None if started.elapsed() >= self.config.timeout => {
+                    child.kill().map_err(|error| {
+                        format!("could not stop timed-out shell step `{}`: {error}", step.id)
+                    })?;
+                    child.wait().map_err(|error| {
+                        format!("could not reap timed-out shell step `{}`: {error}", step.id)
+                    })?;
+                    break None;
+                }
+                None => thread::sleep(Duration::from_millis(10)),
+            }
+        };
+
+        let stdout = join_reader(stdout_reader, &step.id)?;
+        let stderr = join_reader(stderr_reader, &step.id)?;
+        let output = format_output(&stdout, &stderr);
+        match status {
+            Some(status) => Ok(exit_output(status, output)),
+            None => Ok(StepOutput {
+                outcome: "failure".into(),
+                output: format!(
+                    "command timed out after {:?}\n{output}",
+                    self.config.timeout
+                ),
+                exit_code: None,
+            }),
+        }
+    }
+}
+
+impl ShellRunner for ShellRunnerAdapter {
+    fn run(&mut self, step: &Step) -> Result<StepOutput, String> {
+        match &step.kind {
+            StepKind::Shell { command, args } => self.execute(step, command, args),
+            StepKind::Agent { .. } => Err(format!(
+                "shell runner cannot execute agent step `{}`",
+                step.id
+            )),
+        }
+    }
+}
+
+fn read_all(mut reader: impl Read) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn join_reader(
+    reader: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    step_id: &str,
+) -> Result<Vec<u8>, String> {
+    reader
+        .join()
+        .map_err(|_| format!("output reader panicked for shell step `{step_id}`"))?
+        .map_err(|error| format!("could not read output for shell step `{step_id}`: {error}"))
+}
+
+fn format_output(stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout = String::from_utf8_lossy(stdout);
+    let stderr = String::from_utf8_lossy(stderr);
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => stdout.into_owned(),
+        (true, false) => format!("stderr:\n{stderr}"),
+        (false, false) => format!("{stdout}\nstderr:\n{stderr}"),
+    }
+}
+
+fn exit_output(status: ExitStatus, output: String) -> StepOutput {
+    let exit_code = status.code();
+    StepOutput {
+        outcome: if status.success() {
+            "success"
+        } else {
+            "failure"
+        }
+        .into(),
+        output,
+        exit_code,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use factory_core::StepKind;
+
+    fn shell_step(command: &str, args: &[&str]) -> Step {
+        Step {
+            id: "shell".into(),
+            kind: StepKind::Shell {
+                command: command.into(),
+                args: args.iter().map(|arg| (*arg).into()).collect(),
+            },
+            transitions: vec![],
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executes_with_configured_directory_environment_and_exit_code() {
+        let directory = std::env::current_dir().unwrap();
+        let mut config = ShellRunnerConfig::new(directory.clone(), Duration::from_secs(2));
+        config
+            .environment
+            .insert("FACTORY_TEST_VALUE".into(), "controlled".into());
+        let mut runner = ShellRunnerAdapter::new(config);
+        let step = shell_step(
+            "sh",
+            &[
+                "-c",
+                "printf '%s:%s' \"$PWD\" \"$FACTORY_TEST_VALUE\"; exit 7",
+            ],
+        );
+        let output = runner.run(&step).unwrap();
+        assert_eq!(output.outcome, "failure");
+        assert_eq!(output.exit_code, Some(7));
+        assert_eq!(output.output, format!("{}:controlled", directory.display()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminates_processes_that_exceed_the_timeout() {
+        let config = ShellRunnerConfig::new(".", Duration::from_millis(30));
+        let mut runner = ShellRunnerAdapter::new(config);
+        let output = runner
+            .run(&shell_step("sh", &["-c", "exec sleep 2"]))
+            .unwrap();
+        assert_eq!(output.outcome, "failure");
+        assert_eq!(output.exit_code, None);
+        assert!(output.output.contains("timed out"));
+    }
+}
