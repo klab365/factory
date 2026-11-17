@@ -18,6 +18,7 @@ pub enum RunError {
     AmbiguousOutcome { step_id: String, outcome: String },
     MissingTarget { step_id: String, target: String },
     StepLimitExceeded { limit: usize },
+    RepeatedReviewFeedback,
     JournalFailed { message: String },
     InvalidResumeState { message: String },
     InvalidStepKind { step_id: String },
@@ -47,6 +48,9 @@ impl fmt::Display for RunError {
             }
             Self::StepLimitExceeded { limit } => {
                 write!(f, "pipeline exceeded the step execution limit of {limit}")
+            }
+            Self::RepeatedReviewFeedback => {
+                write!(f, "run stopped after repeated identical reviewer feedback")
             }
             Self::JournalFailed { message } => {
                 write!(f, "could not persist pipeline run: {message}")
@@ -221,6 +225,20 @@ pub fn run_pipeline_with_journal<A: AgentRunner, S: ShellRunner, J: RunJournal>(
             .step_completed(&result)
             .map_err(|message| RunError::JournalFailed { message })?;
         let outcome = result.outcome.clone();
+        if outcome == "changes_requested"
+            && result.handoff.is_some()
+            && results.iter().any(|previous: &StepResult| {
+                previous.outcome == "changes_requested"
+                    && same_review_feedback(previous.handoff.as_ref(), result.handoff.as_ref())
+            })
+        {
+            let proceed = journal
+                .confirm_repeated_review_feedback(&result)
+                .map_err(|message| RunError::JournalFailed { message })?;
+            if !proceed {
+                return Err(RunError::RepeatedReviewFeedback);
+            }
+        }
         results.push(result);
 
         let mut matching = step.transitions.iter().filter(|t| t.outcome == outcome);
@@ -260,6 +278,39 @@ pub fn run_pipeline_with_journal<A: AgentRunner, S: ShellRunner, J: RunJournal>(
     }
 }
 
+fn same_review_feedback(
+    previous: Option<&super::run::StepHandoff>,
+    current: Option<&super::run::StepHandoff>,
+) -> bool {
+    use super::run::StepHandoff;
+
+    let (Some(StepHandoff::Review(previous)), Some(StepHandoff::Review(current))) =
+        (previous, current)
+    else {
+        return false;
+    };
+
+    fn signature(handoff: &super::run::ReviewHandoff) -> Vec<(&str, &str, &str, &str, &str)> {
+        let mut findings: Vec<_> = handoff
+            .findings
+            .iter()
+            .map(|finding| {
+                (
+                    finding.title.as_str(),
+                    finding.location.as_str(),
+                    finding.problem.as_str(),
+                    finding.required_change.as_str(),
+                    finding.verification.as_str(),
+                )
+            })
+            .collect();
+        findings.sort_unstable();
+        findings
+    }
+
+    signature(previous) == signature(current)
+}
+
 struct NoopJournal;
 
 impl RunJournal for NoopJournal {
@@ -280,12 +331,15 @@ impl RunJournal for NoopJournal {
 mod tests {
     use super::super::ports::{RunJournal, StepOutput};
     use super::*;
+    use crate::features::{ReviewFinding, ReviewHandoff, StepHandoff};
     use crate::{ModelRef, StepKind, Transition};
     use std::collections::VecDeque;
 
     #[derive(Default)]
     struct RecordingJournal {
         events: Vec<String>,
+        confirmations: usize,
+        proceed_on_repeat: bool,
     }
 
     impl RunJournal for RecordingJournal {
@@ -302,6 +356,11 @@ mod tests {
         fn step_failed(&mut self, step_id: &str, _: &str) -> Result<(), String> {
             self.events.push(format!("failed:{step_id}"));
             Ok(())
+        }
+
+        fn confirm_repeated_review_feedback(&mut self, _: &StepResult) -> Result<bool, String> {
+            self.confirmations += 1;
+            Ok(self.proceed_on_repeat)
         }
     }
 
@@ -490,6 +549,160 @@ mod tests {
         assert_eq!(reviewer_feedback.step_id, "review");
         assert_eq!(reviewer_feedback.outcome, "changes_requested");
         assert_eq!(reviewer_feedback.output, "output-changes_requested");
+    }
+
+    fn finding(title: &str) -> ReviewFinding {
+        ReviewFinding {
+            title: title.into(),
+            location: format!("src/{title}.rs"),
+            problem: format!("problem {title}"),
+            required_change: format!("change {title}"),
+            verification: format!("verify {title}"),
+        }
+    }
+
+    fn review_output(outcome: &str, findings: &[ReviewFinding]) -> StepOutput {
+        StepOutput {
+            outcome: outcome.into(),
+            output: outcome.into(),
+            exit_code: None,
+            attempts: 1,
+            handoff: Some(StepHandoff::Review(ReviewHandoff {
+                findings: findings.to_vec(),
+            })),
+        }
+    }
+
+    fn review_loop_pipeline() -> Pipeline {
+        Pipeline {
+            name: "review-loop".into(),
+            inputs: vec![],
+            steps: vec![
+                agent_step("build", &[("success", "review")]),
+                agent_step(
+                    "review",
+                    &[("changes_requested", "build"), ("approved", "finish")],
+                ),
+                shell_step("finish"),
+            ],
+        }
+    }
+
+    #[test]
+    fn reordered_identical_findings_escalate_and_aborting_preserves_review_history() {
+        let first = finding("one");
+        let second = finding("two");
+        let mut agents = FakeRunner {
+            outputs: VecDeque::from([
+                Ok(StepOutput {
+                    outcome: "success".into(),
+                    output: String::new(),
+                    exit_code: None,
+                    attempts: 1,
+                    handoff: None,
+                }),
+                Ok(review_output(
+                    "changes_requested",
+                    &[first.clone(), second.clone()],
+                )),
+                Ok(StepOutput {
+                    outcome: "success".into(),
+                    output: String::new(),
+                    exit_code: None,
+                    attempts: 1,
+                    handoff: None,
+                }),
+                Ok(review_output("changes_requested", &[second, first])),
+            ]),
+            previous_results: Vec::new(),
+        };
+        let mut shells = FakeRunner::with(&[]);
+        let mut journal = RecordingJournal::default();
+
+        let result = run_pipeline_with_journal(
+            &review_loop_pipeline(),
+            &[agent()],
+            &mut agents,
+            &mut shells,
+            &[],
+            &mut journal,
+            10,
+        );
+
+        assert_eq!(result, Err(RunError::RepeatedReviewFeedback));
+        assert_eq!(journal.confirmations, 1);
+        assert_eq!(
+            journal
+                .events
+                .iter()
+                .filter(|event| event.starts_with("completed:review"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn different_findings_do_not_escalate_but_repeated_feedback_can_continue() {
+        let mut agents = FakeRunner {
+            outputs: VecDeque::from([
+                Ok(StepOutput {
+                    outcome: "success".into(),
+                    output: String::new(),
+                    exit_code: None,
+                    attempts: 1,
+                    handoff: None,
+                }),
+                Ok(review_output("changes_requested", &[finding("one")])),
+                Ok(StepOutput {
+                    outcome: "success".into(),
+                    output: String::new(),
+                    exit_code: None,
+                    attempts: 1,
+                    handoff: None,
+                }),
+                Ok(review_output("changes_requested", &[finding("different")])),
+                Ok(StepOutput {
+                    outcome: "success".into(),
+                    output: String::new(),
+                    exit_code: None,
+                    attempts: 1,
+                    handoff: None,
+                }),
+                Ok(review_output("changes_requested", &[finding("different")])),
+                Ok(StepOutput {
+                    outcome: "success".into(),
+                    output: String::new(),
+                    exit_code: None,
+                    attempts: 1,
+                    handoff: None,
+                }),
+                Ok(review_output("approved", &[])),
+            ]),
+            previous_results: Vec::new(),
+        };
+        let mut shells = FakeRunner::with(&["success"]);
+        let mut journal = RecordingJournal {
+            proceed_on_repeat: true,
+            ..RecordingJournal::default()
+        };
+
+        let report = run_pipeline_with_journal(
+            &review_loop_pipeline(),
+            &[agent()],
+            &mut agents,
+            &mut shells,
+            &[],
+            &mut journal,
+            12,
+        )
+        .unwrap();
+
+        assert_eq!(report.status, RunStatus::Succeeded);
+        assert_eq!(
+            journal.confirmations, 1,
+            "only the exact repeated finding should escalate"
+        );
+        assert!(report.steps.iter().any(|step| step.step_id == "finish"));
     }
 
     #[test]
