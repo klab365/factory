@@ -679,6 +679,10 @@ mod tests {
             &YAML_AGENT.replace("name: coder", "name: reviewer"),
         );
         project.file(
+            ".factory/agents/publisher.yaml",
+            &YAML_AGENT.replace("name: coder", "name: publisher"),
+        );
+        project.file(
             ".factory/pipelines/feature.yaml",
             include_str!("../../../.factory/pipelines/feature.yaml"),
         );
@@ -689,6 +693,12 @@ mod tests {
         };
         let json_flag = args.iter().position(|arg| arg == "--json").unwrap();
         assert_eq!(&args[json_flag + 1..], &["url,number,title,body,labels"]);
+        assert!(
+            config.pipelines[0]
+                .steps
+                .iter()
+                .any(|step| step.id == "publish")
+        );
     }
 
     #[test]
