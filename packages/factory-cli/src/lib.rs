@@ -9,12 +9,14 @@ use std::{
 };
 
 use factory_adapters::{
+    agent::AgentRunnerAdapter,
     config::load_configuration,
+    pi::PiAgentExecutor,
     shell::{ShellRunnerAdapter, ShellRunnerConfig},
 };
 use factory_core::{
     Pipeline, Step, StepKind,
-    features::{AgentRunner, RunReport, RunStatus, StepOutput, run_pipeline},
+    features::{RunReport, RunStatus, run_pipeline},
 };
 
 pub const EXIT_SUCCESS: u8 = 0;
@@ -68,7 +70,7 @@ pub fn run_cli(args: &[String]) -> u8 {
     for path in memory_paths.values() {
         println!("Agent memory: {}", path.display());
     }
-    let mut agent_runner = UnavailableAgentRunner { memory_paths };
+    let mut agent_runner = AgentRunnerAdapter::new(PiAgentExecutor::new(memory_paths));
     let mut shell_runner = ShellRunnerAdapter::new(shell_config(&root));
     match run_pipeline(
         pipeline,
@@ -174,27 +176,6 @@ fn print_report(report: &RunReport) -> u8 {
             );
             EXIT_REVIEW_FAILED
         }
-    }
-}
-
-struct UnavailableAgentRunner {
-    memory_paths: HashMap<String, PathBuf>,
-}
-
-impl AgentRunner for UnavailableAgentRunner {
-    fn run(
-        &mut self,
-        agent: &factory_core::AgentDefinition,
-        step: &Step,
-    ) -> Result<StepOutput, String> {
-        let memory = self
-            .memory_paths
-            .get(&agent.name)
-            .map_or_else(|| "missing".into(), |path| path.display().to_string());
-        Err(format!(
-            "no agent executor configured for `{}` (run memory: {memory}; Pi integration is still required; step `{}`)",
-            agent.name, step.id
-        ))
     }
 }
 
