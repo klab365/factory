@@ -10,12 +10,12 @@ use std::{
 
 use factory_adapters::{
     agent::AgentRunnerAdapter,
-    config::load_configuration,
+    config::{load_configuration, write_and_load_snapshot},
     pi::PiAgentExecutor,
     shell::{ShellRunnerAdapter, ShellRunnerConfig},
 };
 use factory_core::{
-    Pipeline, Step, StepKind,
+    Pipeline, StepKind,
     features::{RunReport, RunStatus, run_pipeline},
 };
 
@@ -42,10 +42,25 @@ pub fn run_cli(args: &[String]) -> u8 {
             return EXIT_CONFIGURATION_ERROR;
         }
     };
-    let configuration = match load_configuration(&root) {
+    let source_configuration = match load_configuration(&root) {
         Ok(configuration) => configuration,
         Err(error) => {
             eprintln!("Configuration error: {error}");
+            return EXIT_CONFIGURATION_ERROR;
+        }
+    };
+    let run_dir = match create_run_dir(&root) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("Could not initialize run directory: {error}");
+            return EXIT_EXECUTION_ERROR;
+        }
+    };
+    let snapshot_path = run_dir.join("config.json");
+    let configuration = match write_and_load_snapshot(&source_configuration, &snapshot_path) {
+        Ok(configuration) => configuration,
+        Err(error) => {
+            eprintln!("Configuration snapshot error: {error}");
             return EXIT_CONFIGURATION_ERROR;
         }
     };
@@ -54,11 +69,11 @@ pub fn run_cli(args: &[String]) -> u8 {
         .iter()
         .find(|pipeline| pipeline.name == *pipeline_name)
     else {
-        eprintln!("Configuration error: pipeline `{pipeline_name}` was not found");
+        eprintln!("Configuration error: pipeline `{pipeline_name}` was not found in snapshot");
         return EXIT_CONFIGURATION_ERROR;
     };
     let memory_paths =
-        match initialize_agent_memories(&root, pipeline, &configuration.agents, &task) {
+        match initialize_agent_memories(&run_dir, pipeline, &configuration.agents, &task) {
             Ok(paths) => paths,
             Err(error) => {
                 eprintln!("Could not initialize run memory: {error}");
@@ -67,6 +82,7 @@ pub fn run_cli(args: &[String]) -> u8 {
         };
 
     println!("Starting pipeline `{}`", pipeline.name);
+    println!("Config snapshot: {}", snapshot_path.display());
     for path in memory_paths.values() {
         println!("Agent memory: {}", path.display());
     }
@@ -87,16 +103,7 @@ pub fn run_cli(args: &[String]) -> u8 {
     }
 }
 
-fn initialize_agent_memories(
-    root: &std::path::Path,
-    pipeline: &Pipeline,
-    agents: &[factory_core::AgentDefinition],
-    task: &str,
-) -> Result<HashMap<String, PathBuf>, String> {
-    let agent_by_name: HashMap<&str, &factory_core::AgentDefinition> = agents
-        .iter()
-        .map(|agent| (agent.name.as_str(), agent))
-        .collect();
+fn create_run_dir(root: &std::path::Path) -> Result<PathBuf, String> {
     let run_id = format!(
         "{}-{}",
         SystemTime::now()
@@ -107,7 +114,19 @@ fn initialize_agent_memories(
     );
     let run_dir = root.join(".factory/runs").join(run_id);
     fs::create_dir_all(&run_dir).map_err(|error| error.to_string())?;
+    Ok(run_dir)
+}
 
+fn initialize_agent_memories(
+    run_dir: &std::path::Path,
+    pipeline: &Pipeline,
+    agents: &[factory_core::AgentDefinition],
+    task: &str,
+) -> Result<HashMap<String, PathBuf>, String> {
+    let agent_by_name: HashMap<&str, &factory_core::AgentDefinition> = agents
+        .iter()
+        .map(|agent| (agent.name.as_str(), agent))
+        .collect();
     let mut seen = HashSet::new();
     let mut memories = HashMap::new();
     for step in &pipeline.steps {
@@ -182,7 +201,7 @@ fn print_report(report: &RunReport) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use factory_core::features::RunError;
+    use factory_core::{Step, features::RunError};
 
     #[test]
     fn distinguishes_terminal_failure_from_execution_errors() {
@@ -224,8 +243,9 @@ mod tests {
             ],
         };
 
+        let run_dir = create_run_dir(&root).unwrap();
         let memories =
-            initialize_agent_memories(&root, &pipeline, &agents, "Add the feature").unwrap();
+            initialize_agent_memories(&run_dir, &pipeline, &agents, "Add the feature").unwrap();
         assert_eq!(memories.len(), 2);
         for path in memories.values() {
             assert!(
