@@ -9,6 +9,8 @@ use super::{
     run::{RunReport, RunStatus, StepResult},
 };
 
+const MAX_REVIEW_CYCLES: usize = 3;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunError {
     EmptyPipeline,
@@ -18,6 +20,7 @@ pub enum RunError {
     AmbiguousOutcome { step_id: String, outcome: String },
     MissingTarget { step_id: String, target: String },
     StepLimitExceeded { limit: usize },
+    ReviewCycleLimitExceeded { limit: usize, step_id: String },
     InvalidStepKind { step_id: String },
 }
 
@@ -46,6 +49,10 @@ impl fmt::Display for RunError {
             Self::StepLimitExceeded { limit } => {
                 write!(f, "pipeline exceeded the step execution limit of {limit}")
             }
+            Self::ReviewCycleLimitExceeded { limit, step_id } => write!(
+                f,
+                "pipeline reached the limit of {limit} review cycles after step `{step_id}` requested changes"
+            ),
             Self::InvalidStepKind { step_id } => {
                 write!(f, "step `{step_id}` has an invalid runner kind")
             }
@@ -77,6 +84,7 @@ pub fn run_pipeline<A: AgentRunner, S: ShellRunner>(
         .map(|agent| (agent.name.as_str(), agent))
         .collect();
     let mut results = Vec::new();
+    let mut review_cycles = 0;
 
     loop {
         if results.len() >= max_step_executions {
@@ -102,7 +110,7 @@ pub fn run_pipeline<A: AgentRunner, S: ShellRunner>(
                         agent: agent.clone(),
                     }
                 })?;
-                agent_runner.run(definition, step)
+                agent_runner.run(definition, step, results.last())
             }
             StepKind::Shell { .. } => shell_runner.run(step),
         }
@@ -118,6 +126,16 @@ pub fn run_pipeline<A: AgentRunner, S: ShellRunner>(
             output: output.output,
             exit_code: output.exit_code,
         });
+
+        if outcome == "changes_requested" && step.transitions.iter().any(|t| t.outcome == outcome) {
+            review_cycles += 1;
+            if review_cycles >= MAX_REVIEW_CYCLES {
+                return Err(RunError::ReviewCycleLimitExceeded {
+                    limit: MAX_REVIEW_CYCLES,
+                    step_id: step.id.clone(),
+                });
+            }
+        }
 
         let mut matching = step.transitions.iter().filter(|t| t.outcome == outcome);
         if let Some(transition) = matching.next() {
@@ -163,12 +181,15 @@ mod tests {
     use crate::{ModelRef, StepKind, Transition};
     use std::collections::VecDeque;
 
-    struct FakeRunner(VecDeque<Result<StepOutput, String>>);
+    struct FakeRunner {
+        outputs: VecDeque<Result<StepOutput, String>>,
+        previous_results: Vec<Option<StepResult>>,
+    }
 
     impl FakeRunner {
         fn with(outcomes: &[&str]) -> Self {
-            Self(
-                outcomes
+            Self {
+                outputs: outcomes
                     .iter()
                     .map(|outcome| {
                         Ok(StepOutput {
@@ -178,22 +199,32 @@ mod tests {
                         })
                     })
                     .collect(),
-            )
+                previous_results: Vec::new(),
+            }
         }
 
         fn failure(message: &str) -> Self {
-            Self(VecDeque::from([Err(message.into())]))
+            Self {
+                outputs: VecDeque::from([Err(message.into())]),
+                previous_results: Vec::new(),
+            }
         }
 
         fn next(&mut self) -> Result<StepOutput, String> {
-            self.0
+            self.outputs
                 .pop_front()
                 .unwrap_or_else(|| Err("no fake result".into()))
         }
     }
 
     impl AgentRunner for FakeRunner {
-        fn run(&mut self, _: &AgentDefinition, _: &Step) -> Result<StepOutput, String> {
+        fn run(
+            &mut self,
+            _: &AgentDefinition,
+            _: &Step,
+            previous_result: Option<&StepResult>,
+        ) -> Result<StepOutput, String> {
+            self.previous_results.push(previous_result.cloned());
             self.next()
         }
     }
@@ -287,6 +318,38 @@ mod tests {
                 .map(|r| r.step_id.as_str())
                 .collect::<Vec<_>>(),
             ["build", "review", "build", "review", "finish"]
+        );
+        let reviewer_feedback = agents.previous_results[2].as_ref().unwrap();
+        assert_eq!(reviewer_feedback.step_id, "review");
+        assert_eq!(reviewer_feedback.outcome, "changes_requested");
+        assert_eq!(reviewer_feedback.output, "output-changes_requested");
+    }
+
+    #[test]
+    fn stops_after_three_review_cycles_instead_of_exhausting_the_step_limit() {
+        let pipeline = Pipeline {
+            name: "review-limit".into(),
+            steps: vec![
+                agent_step("build", &[("success", "review")]),
+                agent_step("review", &[("changes_requested", "build")]),
+            ],
+        };
+        let mut agents = FakeRunner::with(&[
+            "success",
+            "changes_requested",
+            "success",
+            "changes_requested",
+            "success",
+            "changes_requested",
+        ]);
+        let mut shells = FakeRunner::with(&[]);
+
+        assert_eq!(
+            run_pipeline(&pipeline, &[agent()], &mut agents, &mut shells, 100),
+            Err(RunError::ReviewCycleLimitExceeded {
+                limit: 3,
+                step_id: "review".into(),
+            })
         );
     }
 

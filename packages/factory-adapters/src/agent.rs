@@ -1,11 +1,16 @@
 //! Adapter boundary for harness-specific agent execution.
 
-use factory_core::features::{AgentRunner, StepOutput};
+use factory_core::features::{AgentRunner, StepOutput, StepResult};
 use factory_core::{AgentDefinition, Step, StepKind};
 
 /// Backend contract implemented by a concrete agent harness integration.
 pub trait AgentExecutor {
-    fn execute(&mut self, agent: &AgentDefinition, step: &Step) -> Result<StepOutput, String>;
+    fn execute(
+        &mut self,
+        agent: &AgentDefinition,
+        step: &Step,
+        previous_result: Option<&StepResult>,
+    ) -> Result<StepOutput, String>;
 }
 
 /// Bridges the application port to a harness executor without exposing
@@ -25,10 +30,15 @@ impl<E> AgentRunnerAdapter<E> {
 }
 
 impl<E: AgentExecutor> AgentRunner for AgentRunnerAdapter<E> {
-    fn run(&mut self, agent: &AgentDefinition, step: &Step) -> Result<StepOutput, String> {
+    fn run(
+        &mut self,
+        agent: &AgentDefinition,
+        step: &Step,
+        previous_result: Option<&StepResult>,
+    ) -> Result<StepOutput, String> {
         match &step.kind {
             StepKind::Agent { agent: step_agent } if step_agent == &agent.name => {
-                self.executor.execute(agent, step)
+                self.executor.execute(agent, step, previous_result)
             }
             StepKind::Agent { agent: step_agent } => Err(format!(
                 "agent step `{}` references `{step_agent}`, but runner received `{}`",
@@ -50,7 +60,12 @@ mod tests {
     struct FakeExecutor;
 
     impl AgentExecutor for FakeExecutor {
-        fn execute(&mut self, _: &AgentDefinition, _: &Step) -> Result<StepOutput, String> {
+        fn execute(
+            &mut self,
+            _: &AgentDefinition,
+            _: &Step,
+            _: Option<&StepResult>,
+        ) -> Result<StepOutput, String> {
             Ok(StepOutput {
                 outcome: "success".into(),
                 output: "done".into(),
@@ -76,6 +91,6 @@ mod tests {
             transitions: vec![],
         };
         let mut runner = AgentRunnerAdapter::new(FakeExecutor);
-        assert_eq!(runner.run(&agent, &step).unwrap().outcome, "success");
+        assert_eq!(runner.run(&agent, &step, None).unwrap().outcome, "success");
     }
 }
