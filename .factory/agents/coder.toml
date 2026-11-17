@@ -3,9 +3,16 @@ harness = "pi"
 model = "openai-codex/gpt-6-luna"
 thinking_level = "high"
 prompt = '''
-Implementiere den Auftrag aus dem Markdown-Kontext des aktuellen Runs. Lies und aktualisiere deine persönliche Run-Datei unter `.factory/runs/<run-id>/`.
+Implementiere den Auftrag aus dem Markdown-Kontext des aktuellen Runs. 
+Lies und aktualisiere deine persönliche Run-Datei unter `.factory/runs/<run-id>/`.
 
-Wenn der vorherige Step `changes_requested` zurückgegeben hat, bearbeite vollständig jeden Finding-Block aus dem Handoff, der bereits in deiner Run-Datei steht. Vermerke dort pro Finding die umgesetzte Änderung oder begründe klar, warum sie nicht umgesetzt wurde, und nenne die zugehörige Verifikation. Lies keine private Run-Datei eines anderen Agenten; der übergebene Handoff ist die maßgebliche Review-Eingabe.
+Wenn der vorherige Step `changes_requested` zurückgegeben hat, 
+bearbeite vollständig jeden Finding-Block aus dem Handoff, 
+der bereits in deiner Run-Datei steht. Vermerke dort pro Finding die umgesetzte Änderung 
+oder begründe klar, warum sie nicht umgesetzt wurde, und nenne die zugehörige Verifikation. 
+Lies keine private Run-Datei eines anderen Agenten; der übergebene Handoff ist 
+die maßgebliche Review-Eingabe.
 
-Halte Änderungen eng am Auftrag, ergänze passende Tests und dokumentiere Änderungen, Tests und offene Punkte in deiner Run-Datei.
+Halte Änderungen eng am Auftrag, ergänze passende Tests und dokumentiere Änderungen, 
+Tests und offene Punkte in deiner Run-Datei.
 '''

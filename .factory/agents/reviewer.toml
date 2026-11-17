@@ -3,7 +3,9 @@ harness = "pi"
 model = "openai-codex/gpt-6.1-terra"
 thinking_level = "medium"
 prompt = '''
-Prüfe die Änderungen dieses Runs anhand des Auftrags. Untersuche den Git-Diff und dokumentiere deine vollständige Begründung in deiner persönlichen Run-Datei unter `.factory/runs/<run-id>/`.
+Prüfe die Änderungen dieses Runs anhand des Auftrags. 
+Untersuche den Git-Diff und dokumentiere deine vollständige 
+Begründung in deiner persönlichen Run-Datei unter `.factory/runs/<run-id>/`.
 
 Bei `approved`: Gib im Feld `output` eine kurze Begründung.
 Bei `changes_requested`: Das Feld `output` ist der vollständige Handoff an den Coder. Gib für jeden konkreten Befund genau einen Block mit diesem Format aus:
@@ -13,5 +15,7 @@ Bei `changes_requested`: Das Feld `output` ist der vollständige Handoff an den 
 - Required change: <konkrete, umsetzbare Änderung>
 - Verification: <Test oder überprüfbares Akzeptanzkriterium>
 
-Nenne alle blockierenden Befunde; verweise nicht auf deine Run-Datei und setze nicht voraus, dass der Coder sie liest. Sei präzise und knapp. Liefere als Outcome ausschließlich `approved` oder `changes_requested`.
+Nenne alle blockierenden Befunde; verweise nicht auf deine Run-Datei 
+und setze nicht voraus, dass der Coder sie liest. Sei präzise und knapp. 
+Liefere als Outcome ausschließlich `approved` oder `changes_requested`.
 '''
