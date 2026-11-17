@@ -40,7 +40,7 @@ Unter `.factory/runs/<run-id>/` liegt das run-spezifische Agentengedächtnis: Je
 
 ## Ablauf und Ergebnisse
 
-Der Core sollte keine frei formulierten Agentenantworten selbst als Kontrollfluss interpretieren. Adapter bzw. Application-Schicht liefern strukturierte Ergebnisse und benannte Outcomes; die Pipeline definiert, welches Outcome zu welchem Schritt führt. Schleifen und Wiederholungen müssen begrenzt sein, damit fehlerhafte Konfigurationen keine Endlosschleifen erzeugen.
+Der Core sollte keine frei formulierten Agentenantworten selbst als Kontrollfluss interpretieren. Adapter bzw. Application-Schicht liefern strukturierte Ergebnisse und benannte Outcomes; die Pipeline definiert, welches Outcome zu welchem Schritt führt. Schleifen und Wiederholungen müssen begrenzt sein, damit fehlerhafte Konfigurationen keine Endlosschleifen erzeugen. Jeder Run speichert die validierte Konfiguration in `.factory/runs/<run-id>/config.json` und verwendet während der Ausführung nur diesen Snapshot.
 
 Shell-Schritte brauchen mindestens ein konfigurierbares Arbeitsverzeichnis, Timeout, Abbruchverhalten und kontrollierte Umgebungsvariablen. Da sie beliebige Prozesse starten können, sollten sie als Sicherheitsgrenze behandelt werden; insbesondere dürfen nicht vertrauenswürdige Pipeline-Dateien nicht automatisch ausgeführt werden.
 
