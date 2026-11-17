@@ -10,7 +10,8 @@ use std::{
 };
 
 use factory_core::{
-    AgentDefinition, ModelRef, Pipeline, PipelineInput, Step, StepKind, ThinkingLevel, Transition,
+    AgentDefinition, HumanOption, ModelRef, Pipeline, PipelineInput, Step, StepKind, ThinkingLevel,
+    Transition,
 };
 use serde::{Deserialize, Serialize};
 
@@ -266,6 +267,18 @@ fn pipeline_to_dto(pipeline: &Pipeline) -> PipelineDto {
                         args: args.clone(),
                         transitions,
                     },
+                    StepKind::Human { prompt, options } => StepDto::Human {
+                        id: step.id.clone(),
+                        prompt: prompt.clone(),
+                        options: options
+                            .iter()
+                            .map(|option| HumanOptionDto {
+                                id: option.id.clone(),
+                                label: option.label.clone(),
+                            })
+                            .collect(),
+                        transitions,
+                    },
                 }
             })
             .collect(),
@@ -397,6 +410,20 @@ enum StepDto {
         #[serde(default)]
         transitions: Vec<TransitionDto>,
     },
+    Human {
+        id: String,
+        prompt: String,
+        #[serde(default)]
+        options: Vec<HumanOptionDto>,
+        #[serde(default)]
+        transitions: Vec<TransitionDto>,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+struct HumanOptionDto {
+    id: String,
+    label: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -486,6 +513,40 @@ fn validate_pipeline(
                     ));
                 }
                 (id, StepKind::Agent { agent }, transitions)
+            }
+            StepDto::Human {
+                id,
+                prompt,
+                options,
+                transitions,
+            } => {
+                if prompt.trim().is_empty() {
+                    return Err(invalid(
+                        path,
+                        format!(
+                            "pipeline `{}` step `{id}` field `prompt` must not be empty",
+                            dto.name
+                        ),
+                    ));
+                }
+                let mut option_ids = HashSet::new();
+                let options = options.into_iter().map(|option| {
+                    if option.id.trim().is_empty()
+                        || option.id.trim() != option.id
+                        || option.label.trim().is_empty()
+                        || !option_ids.insert(option.id.clone())
+                    {
+                        return Err(invalid(
+                            path,
+                            format!(
+                                "pipeline `{}` step `{id}` has an empty, whitespace-padded, or duplicate human option ID/label",
+                                dto.name
+                            ),
+                        ));
+                    }
+                    Ok(HumanOption { id: option.id, label: option.label })
+                }).collect::<Result<Vec<_>, _>>()?;
+                (id, StepKind::Human { prompt, options }, transitions)
             }
             StepDto::Shell {
                 id,
@@ -769,6 +830,31 @@ mod tests {
         let error = load_configuration(&project.0).unwrap_err();
         assert!(error.message.contains("pipeline `feature` step `build`"));
         assert!(error.message.contains("unknown agent `missing`"));
+    }
+
+    #[test]
+    fn rejects_human_option_ids_with_surrounding_whitespace_and_normalization_collisions() {
+        for ids in [
+            [" approve", "reject"],
+            ["approve ", "reject"],
+            ["approve", " approve "],
+        ] {
+            let project = TempProject::new();
+            project.file(".factory/agents/coder.toml", AGENT);
+            let options = ids
+                .iter()
+                .map(|id| format!("{{ id = '{id}', label = 'Option' }}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            project.file(
+                ".factory/pipelines/feature.toml",
+                &format!(
+                    "name = 'feature'\n[[inputs]]\nkey = 'task'\ndescription = 'Task'\n[[steps]]\nid = 'ask'\ntype = 'human'\nprompt = 'Choose'\noptions = [{options}]\n"
+                ),
+            );
+            let error = load_configuration(&project.0).unwrap_err();
+            assert!(error.message.contains("whitespace-padded"), "{error}");
+        }
     }
 
     #[test]

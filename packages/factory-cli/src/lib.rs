@@ -276,7 +276,10 @@ fn resume_run(
         );
         return EXIT_USAGE_ERROR;
     }
-    if retry_current && let Err(error) = store.mark_interrupted() {
+    if retry_current
+        && store.record().status != PersistedRunStatus::WaitingForInput
+        && let Err(error) = store.mark_interrupted()
+    {
         eprintln!("Could not update run state: {error}");
         return EXIT_EXECUTION_ERROR;
     }
@@ -322,7 +325,17 @@ fn resume_run(
     let mut agent_runner = AgentRunnerAdapter::new(PiAgentExecutor::new(memory_paths));
     let mut shell_runner =
         ShellRunnerAdapter::new(shell_config(root, store.record().inputs.clone()));
-    let completed = store.completed_results();
+    let mut completed = store.completed_results();
+    if store.record().status == PersistedRunStatus::WaitingForInput {
+        let answer = read_resume_answer(store);
+        match answer.and_then(|answer| store.answer_pending_human(&answer)) {
+            Ok(result) => completed.push(result),
+            Err(error) => {
+                eprintln!("Human answer error: {error}");
+                return EXIT_USAGE_ERROR;
+            }
+        }
+    }
     execute_pipeline_and_finish(
         store,
         pipeline,
@@ -377,6 +390,10 @@ fn finish_pipeline_result(
             print_report(&report, pipeline)
         }
         Err(error) => {
+            if store.record().status == PersistedRunStatus::WaitingForInput {
+                eprintln!("{}", error);
+                return EXIT_SUCCESS;
+            }
             eprintln!("Execution error: {error}");
             if let Err(journal_error) = store.finish(PersistedRunStatus::Failed) {
                 eprintln!("Could not persist failed run status: {journal_error}");
@@ -384,6 +401,28 @@ fn finish_pipeline_result(
             EXIT_EXECUTION_ERROR
         }
     }
+}
+
+fn read_resume_answer(store: &RunStore) -> Result<String, String> {
+    let pending = store
+        .record()
+        .pending_human
+        .as_ref()
+        .ok_or("pending question is missing")?;
+    println!("{}", pending.prompt);
+    for option in &pending.options {
+        println!("  {}: {}", option.id, option.label);
+    }
+    if !io::stdin().is_terminal() {
+        return Err("Human answer required; rerun resume interactively".into());
+    }
+    eprint!("Answer: ");
+    io::stderr().flush().map_err(|e| e.to_string())?;
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| e.to_string())?;
+    Ok(answer.trim().to_owned())
 }
 
 fn fail_run(store: &mut RunStore, exit_code: u8) -> u8 {
@@ -568,6 +607,53 @@ impl RunJournal for ConsoleRunJournal<'_> {
         Ok(())
     }
 
+    fn human_answer(
+        &mut self,
+        step_id: &str,
+        prompt: &str,
+        options: &[factory_core::HumanOption],
+    ) -> Result<String, String> {
+        self.store
+            .wait_for_human(step_id, prompt, options)
+            .map_err(|e| e.to_string())?;
+        if !io::stdin().is_terminal() {
+            return Err("Human step is waiting for input; resume this run to answer".into());
+        }
+        println!("{prompt}");
+        for option in options {
+            println!("  {}: {}", option.id, option.label);
+        }
+        loop {
+            eprint!("Answer: ");
+            io::stderr().flush().map_err(|error| error.to_string())?;
+            let mut answer = String::new();
+            let bytes = match io::stdin().read_line(&mut answer) {
+                Ok(bytes) => bytes,
+                Err(error) => return Err(format!("could not read human answer: {error}")),
+            };
+            if bytes == 0 {
+                return Err("stdin is closed; human question remains pending".into());
+            }
+            let answer = answer.trim().to_owned();
+            if answer.is_empty() {
+                eprintln!("Human answer must not be empty.");
+                continue;
+            }
+            if !options.is_empty() && !options.iter().any(|option| option.id == answer) {
+                eprintln!(
+                    "Choose one of: {}",
+                    options
+                        .iter()
+                        .map(|option| option.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                continue;
+            }
+            return Ok(answer);
+        }
+    }
+
     fn step_failed(&mut self, step_id: &str, error: &str) -> Result<(), String> {
         self.store.step_failed(step_id, error)?;
         eprintln!("Step `{step_id}` execution error: {error}");
@@ -639,7 +725,7 @@ fn terminal_failure_exit_code(report: &RunReport, pipeline: &Pipeline) -> u8 {
         return EXIT_EXECUTION_ERROR;
     };
     match step.kind {
-        StepKind::Shell { .. } => EXIT_EXECUTION_ERROR,
+        StepKind::Shell { .. } | StepKind::Human { .. } => EXIT_EXECUTION_ERROR,
         StepKind::Agent { .. } => EXIT_REVIEW_FAILED,
     }
 }
@@ -763,6 +849,37 @@ mod tests {
         assert_eq!(
             run_new_pipeline_from_root(&root, "missing", "task", HashMap::new()),
             EXIT_CONFIGURATION_ERROR
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_human_pause_persistence_is_an_execution_error() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("factory-human-persist-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let mut store = test_store(&root, "human");
+        let run_dir = store.run_dir().to_path_buf();
+        fs::remove_dir_all(&run_dir).unwrap();
+        assert!(store.wait_for_human("ask", "Choose", &[]).is_err());
+        assert_ne!(store.record().status, PersistedRunStatus::WaitingForInput);
+        assert_eq!(
+            finish_pipeline_result(
+                &mut store,
+                Err(RunError::RunnerFailed {
+                    step_id: "ask".into(),
+                    message: "could not persist pending question".into(),
+                }),
+                &Pipeline {
+                    name: "human".into(),
+                    inputs: vec![],
+                    steps: vec![]
+                },
+            ),
+            EXIT_EXECUTION_ERROR
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -1022,7 +1139,11 @@ mod tests {
     struct FailedShell;
 
     impl factory_core::features::ShellRunner for FailedShell {
-        fn run(&mut self, _step: &Step) -> Result<factory_core::features::StepOutput, String> {
+        fn run(
+            &mut self,
+            _step: &Step,
+            _previous_result: Option<&StepResult>,
+        ) -> Result<factory_core::features::StepOutput, String> {
             Err("command failed".into())
         }
     }

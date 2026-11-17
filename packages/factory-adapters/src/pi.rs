@@ -198,6 +198,9 @@ impl PiAgentExecutor {
         if agent.name == "reviewer" && response.outcome == "changes_requested" {
             match response.handoff.as_ref() {
                 Some(StepHandoff::Review(review)) => validate_review_handoff(review)?,
+                Some(StepHandoff::Human { .. }) => {
+                    return Err("reviewer handoff must be review feedback".into());
+                }
                 None => {
                     return Err(
                         "reviewer changes_requested response must include a structured review handoff"
@@ -289,6 +292,17 @@ fn record_handoff(
     };
     let complete_output = match previous.handoff.as_ref() {
         Some(StepHandoff::Review(review)) => render_review_handoff(review),
+        Some(StepHandoff::Human {
+            prompt,
+            answer,
+            option_id,
+        }) => serde_json::json!({
+            "kind": "human",
+            "prompt": prompt,
+            "answer": answer,
+            "option_id": option_id,
+        })
+        .to_string(),
         None => previous.output.clone(),
     };
     let previous_output = if complete_output.chars().count() > MAX_HANDOFF_CHARS {

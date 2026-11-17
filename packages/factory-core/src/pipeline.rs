@@ -22,8 +22,24 @@ pub struct Step {
 /// The executor selected for a step. Concrete execution lives in adapters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepKind {
-    Agent { agent: String },
-    Shell { command: String, args: Vec<String> },
+    Agent {
+        agent: String,
+    },
+    Shell {
+        command: String,
+        args: Vec<String>,
+    },
+    Human {
+        prompt: String,
+        options: Vec<HumanOption>,
+    },
+}
+
+/// Stable selectable answer offered by a human step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HumanOption {
+    pub id: String,
+    pub label: String,
 }
 
 /// Routes a named step outcome to another step, e.g. `approved` -> `commit`.

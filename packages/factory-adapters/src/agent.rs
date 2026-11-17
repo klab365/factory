@@ -44,8 +44,8 @@ impl<E: AgentExecutor> AgentRunner for AgentRunnerAdapter<E> {
                 "agent step `{}` references `{step_agent}`, but runner received `{}`",
                 step.id, agent.name
             )),
-            StepKind::Shell { .. } => Err(format!(
-                "agent runner cannot execute shell step `{}`",
+            StepKind::Shell { .. } | StepKind::Human { .. } => Err(format!(
+                "agent runner cannot execute non-agent step `{}`",
                 step.id
             )),
         }
