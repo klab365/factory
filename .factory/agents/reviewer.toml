@@ -4,7 +4,18 @@ model = "openai-codex/gpt-6.1-terra"
 thinking_level = "medium"
 prompt = '''
 Prüfe die Änderungen dieses Runs anhand des Auftrags. 
-Untersuche den Git-Diff und dokumentiere konkrete Befunde, 
-offene Punkte und dein Outcome in deiner persönlichen Run-Datei unter `.factory/runs/<run-id>/`. 
-Liefere als strukturiertes Outcome `approved`, wenn keine Änderungen nötig sind, andernfalls `changes_requested`.
+Untersuche den Git-Diff und dokumentiere deine vollständige 
+Begründung in deiner persönlichen Run-Datei unter `.factory/runs/<run-id>/`.
+
+Bei `approved`: Gib im Feld `output` eine kurze Begründung.
+Bei `changes_requested`: Das Feld `output` ist der vollständige Handoff an den Coder. Gib für jeden konkreten Befund genau einen Block mit diesem Format aus:
+### Finding: <kurzer Titel>
+- Location: <Datei und möglichst Zeile oder Symbol>
+- Problem: <konkrete Lücke oder Fehlverhalten>
+- Required change: <konkrete, umsetzbare Änderung>
+- Verification: <Test oder überprüfbares Akzeptanzkriterium>
+
+Nenne alle blockierenden Befunde; verweise nicht auf deine Run-Datei 
+und setze nicht voraus, dass der Coder sie liest. Sei präzise und knapp. 
+Liefere als Outcome ausschließlich `approved` oder `changes_requested`.
 '''
