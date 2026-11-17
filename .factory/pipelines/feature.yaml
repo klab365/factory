@@ -41,3 +41,10 @@ steps:
     type: shell
     command: mise
     args: [test]
+    transitions:
+      - outcome: success
+        target_step: publish
+
+  - id: publish
+    type: agent
+    agent: publisher
