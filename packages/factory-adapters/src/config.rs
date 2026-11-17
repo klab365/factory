@@ -1,4 +1,4 @@
-//! TOML configuration loading and validation for factory-core domain types.
+//! TOML and YAML configuration loading and validation for factory-core domain types.
 
 use std::{
     collections::HashSet,
@@ -34,13 +34,13 @@ impl fmt::Display for ConfigError {
 
 impl Error for ConfigError {}
 
-/// Loads and validates all agent and pipeline TOML files beneath `.factory/`.
+/// Loads and validates all agent and pipeline TOML or YAML files beneath `.factory/`.
 pub fn load_configuration(root: impl AsRef<Path>) -> Result<Configuration, ConfigError> {
     let root = root.as_ref();
     let agent_dir = root.join(".factory/agents");
     let pipeline_dir = root.join(".factory/pipelines");
-    let agent_paths = toml_files(&agent_dir)?;
-    let pipeline_paths = toml_files(&pipeline_dir)?;
+    let agent_paths = configuration_files(&agent_dir)?;
+    let pipeline_paths = configuration_files(&pipeline_dir)?;
 
     let mut agents = Vec::with_capacity(agent_paths.len());
     let mut agent_names = HashSet::new();
@@ -148,7 +148,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     fs::File::open(parent)?.sync_all()
 }
 
-fn toml_files(dir: &Path) -> Result<Vec<PathBuf>, ConfigError> {
+fn configuration_files(dir: &Path) -> Result<Vec<PathBuf>, ConfigError> {
     let entries = fs::read_dir(dir).map_err(|error| ConfigError {
         path: dir.to_owned(),
         message: format!("could not read configuration directory: {error}"),
@@ -161,9 +161,9 @@ fn toml_files(dir: &Path) -> Result<Vec<PathBuf>, ConfigError> {
         })?;
         let path = entry.path();
         if path.is_file()
-            && path
-                .extension()
-                .is_some_and(|extension| extension == "toml")
+            && path.extension().is_some_and(|extension| {
+                extension == "toml" || extension == "yml" || extension == "yaml"
+            })
         {
             paths.push(path);
         }
@@ -177,10 +177,18 @@ fn parse_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, ConfigErro
         path: path.to_owned(),
         message: format!("could not read file: {error}"),
     })?;
-    toml::from_str(&source).map_err(|error| ConfigError {
-        path: path.to_owned(),
-        message: format!("invalid TOML: {error}"),
-    })
+    let extension = path.extension().and_then(|value| value.to_str());
+    match extension {
+        Some("yml" | "yaml") => serde_yaml::from_str(&source).map_err(|error| ConfigError {
+            path: path.to_owned(),
+            message: format!("invalid YAML: {error}"),
+        }),
+        Some("toml") => toml::from_str(&source).map_err(|error| ConfigError {
+            path: path.to_owned(),
+            message: format!("invalid TOML: {error}"),
+        }),
+        _ => Err(invalid(path, "unsupported configuration file extension")),
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -445,6 +453,12 @@ fn validate_pipeline(
             description: input.description,
         });
     }
+    if inputs.is_empty() {
+        return Err(invalid(
+            path,
+            format!("pipeline `{}` must declare at least one input", dto.name),
+        ));
+    }
     if dto.steps.is_empty() {
         return Err(invalid(
             path,
@@ -583,6 +597,7 @@ mod tests {
     }
 
     const AGENT: &str = "name = 'coder'\nharness = 'pi'\nmodel = 'openai-codex/gpt-6-luna'\nthinking_level = 'high'\nprompt = 'Implement the task.'\n";
+    const YAML_AGENT: &str = "name: coder\nharness: pi\nmodel: openai-codex/gpt-6-luna\nthinking_level: high\nprompt: Implement the task.\n";
 
     #[test]
     fn loads_agent_and_pipeline_into_core_types() {
@@ -616,10 +631,10 @@ mod tests {
     #[test]
     fn snapshots_configuration_as_json_and_reloads_the_saved_copy() {
         let project = TempProject::new();
-        let agent_path = project.file(".factory/agents/coder.toml", AGENT);
+        let agent_path = project.file(".factory/agents/coder.yml", YAML_AGENT);
         project.file(
-            ".factory/pipelines/feature.toml",
-            "name = 'feature'\n\n[[steps]]\nid = 'build'\ntype = 'agent'\nagent = 'coder'\n",
+            ".factory/pipelines/feature.yaml",
+            "name: feature\ninputs:\n  - key: task\n    description: Task to implement\nsteps:\n  - id: build\n    type: agent\n    agent: coder\n",
         );
         let original = load_configuration(&project.0).unwrap();
         let run_dir = project.0.join(".factory/runs/run-1");
@@ -633,7 +648,7 @@ mod tests {
 
         fs::write(
             agent_path,
-            AGENT.replace("Implement the task.", "Changed after run start."),
+            YAML_AGENT.replace("Implement the task.", "Changed after run start."),
         )
         .unwrap();
         assert_eq!(
@@ -652,12 +667,94 @@ mod tests {
     }
 
     #[test]
+    fn migrated_feature_pipeline_passes_github_json_fields_as_one_argument() {
+        let project = TempProject::new();
+        project.file(".factory/agents/coder.yaml", YAML_AGENT);
+        project.file(
+            ".factory/agents/planner.yaml",
+            &YAML_AGENT.replace("name: coder", "name: planner"),
+        );
+        project.file(
+            ".factory/agents/reviewer.yaml",
+            &YAML_AGENT.replace("name: coder", "name: reviewer"),
+        );
+        project.file(
+            ".factory/pipelines/feature.yaml",
+            include_str!("../../../.factory/pipelines/feature.yaml"),
+        );
+
+        let config = load_configuration(&project.0).unwrap();
+        let StepKind::Shell { args, .. } = &config.pipelines[0].steps[0].kind else {
+            panic!("issue-intake must be a shell step");
+        };
+        let json_flag = args.iter().position(|arg| arg == "--json").unwrap();
+        assert_eq!(&args[json_flag + 1..], &["url,number,title,body,labels"]);
+    }
+
+    #[test]
+    fn loads_both_yaml_extensions_and_validates_core_types() {
+        let project = TempProject::new();
+        project.file(".factory/agents/coder.yml", YAML_AGENT);
+        project.file(
+            ".factory/pipelines/feature.yaml",
+            "name: feature\ninputs:\n  - key: target\n    description: The target value\nsteps:\n  - id: build\n    type: agent\n    agent: coder\n    transitions:\n      - outcome: success\n        target_step: test\n  - id: test\n    type: shell\n    command: cargo\n    args: [test]\n",
+        );
+        let config = load_configuration(&project.0).unwrap();
+        assert_eq!(config.agents[0].name, "coder");
+        assert_eq!(config.pipelines[0].inputs[0].key, "target");
+        assert_eq!(
+            config.pipelines[0].steps[0].transitions[0].target_step,
+            "test"
+        );
+        assert_eq!(
+            config.pipelines[0].steps[1].kind,
+            StepKind::Shell {
+                command: "cargo".into(),
+                args: vec!["test".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn reports_yaml_syntax_errors_with_the_file_path() {
+        let project = TempProject::new();
+        let path = project.file(".factory/agents/broken.yaml", "name: [");
+        let error = load_configuration(&project.0).unwrap_err();
+        assert!(error.to_string().contains(path.to_str().unwrap()));
+        assert!(error.message.contains("invalid YAML"));
+    }
+
+    #[test]
+    fn rejects_pipelines_without_inputs() {
+        let project = TempProject::new();
+        project.file(".factory/agents/coder.yaml", YAML_AGENT);
+        project.file(
+            ".factory/pipelines/feature.yaml",
+            "name: feature\nsteps:\n  - id: build\n    type: agent\n    agent: coder\n",
+        );
+        let error = load_configuration(&project.0).unwrap_err();
+        assert!(error.message.contains("must declare at least one input"));
+    }
+
+    #[test]
+    fn reports_yaml_semantic_reference_errors() {
+        let project = TempProject::new();
+        project.file(".factory/agents/coder.yml", YAML_AGENT);
+        project.file(
+            ".factory/pipelines/feature.yaml",
+            "name: feature\ninputs:\n  - key: task\n    description: Task to implement\nsteps:\n  - id: build\n    type: agent\n    agent: missing\n",
+        );
+        let error = load_configuration(&project.0).unwrap_err();
+        assert!(error.message.contains("unknown agent `missing`"));
+    }
+
+    #[test]
     fn reports_semantic_reference_errors_with_pipeline_and_step() {
         let project = TempProject::new();
         project.file(".factory/agents/coder.toml", AGENT);
         project.file(
             ".factory/pipelines/feature.toml",
-            "name = 'feature'\n\n[[steps]]\nid = 'build'\ntype = 'agent'\nagent = 'missing'\n",
+            "name = 'feature'\n\n[[inputs]]\nkey = 'task'\ndescription = 'Task to implement'\n\n[[steps]]\nid = 'build'\ntype = 'agent'\nagent = 'missing'\n",
         );
         let error = load_configuration(&project.0).unwrap_err();
         assert!(error.message.contains("pipeline `feature` step `build`"));

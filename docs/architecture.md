@@ -12,27 +12,27 @@ factory-core::features
 factory-core <-- Ports <-- Harness-, Shell-, Git- und Persistence-Adapter
 ```
 
-- **Core** enthält Domänenmodelle und Ablaufregeln. Die Use-Cases liegen als Module direkt unter `factory-core::features`; auch diese Module haben keine TOML-, Pi-, CLI- oder HTTP-Abhängigkeiten.
+- **Core** enthält Domänenmodelle und Ablaufregeln. Die Use-Cases liegen als Module direkt unter `factory-core::features`; auch diese Module haben keine TOML-, YAML-, Pi-, CLI- oder HTTP-Abhängigkeiten.
 - **Application** orchestriert Anwendungsfälle wie Pipeline starten, pausieren und fortsetzen und nutzt Runner-Ports.
-- **Adapter** implementieren die Außenwelt: TOML laden, Agenten/Harnesses starten, Shell-Befehle ausführen, Git bedienen und Runs speichern.
+- **Adapter** implementieren die Außenwelt: TOML- und YAML-Konfigurationen laden, Agenten/Harnesses starten, Shell-Befehle ausführen, Git bedienen und Runs speichern.
 - Pi ist zunächst ein Einstiegspunkt bzw. eine UI, nicht Teil der Workflow-Domäne. Später können CLI und Webserver dieselben Application-Use-Cases aufrufen.
 
 ## Konfigurationsformat und Struktur
 
-TOML ist das zunächst gewählte Format. Agenten und Pipelines werden getrennt abgelegt, damit Agentendefinitionen wiederverwendet werden können:
+Agenten und Pipelines können als YAML (`.yml` oder `.yaml`) oder aus Kompatibilitätsgründen weiterhin als TOML abgelegt werden. Agenten und Pipelines werden getrennt gespeichert, damit Agentendefinitionen wiederverwendet werden können:
 
 ```text
 .factory/
   agents/
-    planner.toml
-    coder.toml
-    reviewer.toml
+    planner.yaml
+    coder.yaml
+    reviewer.yaml
   pipelines/
-    feature.toml
-    bugfix.toml
+    feature.yaml
+    bugfix.yaml
 ```
 
-Eine Agentendefinition enthält mindestens `name`, `harness`, `model`, `thinking_level` und `prompt`. Das Modell hat die Form `provider/model`, beispielsweise `anthropic/claude-sonnet-4`. `harness` beschreibt den ausführenden Adapter; es ist unabhängig vom Provider des Modells. Der Prompt liegt zunächst inline als mehrzeiliger TOML-String.
+Eine Agentendefinition enthält mindestens `name`, `harness`, `model`, `thinking_level` und `prompt`. Das Modell hat die Form `provider/model`, beispielsweise `anthropic/claude-sonnet-4`. `harness` beschreibt den ausführenden Adapter; es ist unabhängig vom Provider des Modells. Der Prompt liegt inline als mehrzeiliger YAML-Block-String.
 
 Pipelines definieren Schritte mit explizitem `type = "agent"` oder `type = "shell"`. Agentenschritte referenzieren Agenten per Namen. Übergänge bilden Entscheidungen und Schleifen ab, zum Beispiel Review-Ergebnis `changes_requested` zurück zu `build` oder `approved` weiter zu `commit`.
 
@@ -46,7 +46,7 @@ Shell-Schritte brauchen mindestens ein konfigurierbares Arbeitsverzeichnis, Time
 
 ## `factory-core`
 
-`packages/factory-core` enthält die formatneutralen Domänentypen für Agenten, Modellreferenzen, Thinking-Level sowie Pipelines, Schritte und Übergänge. Die Use-Cases liegen als Module direkt unter `factory-core::features` und orchestrieren diese Modelle über Ports. TOML-Deserialisierung gehört in `factory-adapters::config`; Harness-spezifische Umsetzung und Prozessausführung gehören ebenfalls in Adapter.
+`packages/factory-core` enthält die formatneutralen Domänentypen für Agenten, Modellreferenzen, Thinking-Level sowie Pipelines, Schritte und Übergänge. Die Use-Cases liegen als Module direkt unter `factory-core::features` und orchestrieren diese Modelle über Ports. TOML-/YAML-Deserialisierung und formatunabhängige Validierung gehören in `factory-adapters::config`; Harness-spezifische Umsetzung und Prozessausführung gehören ebenfalls in Adapter. Der Adapter parst `.toml`, `.yml` und `.yaml` in dieselben Core-Typen. Der Run-Snapshot unter `config.json` bleibt davon unabhängig und wird als versioniertes JSON gespeichert.
 
 Die Thinking-Level sind zunächst als gemeinsames Set modelliert (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`). Adapter müssen prüfen bzw. übersetzen, welche Werte ein konkreter Harness oder ein Modell unterstützt.
 
@@ -56,7 +56,7 @@ Die Thinking-Level sind zunächst als gemeinsames Set modelliert (`off`, `minima
 
 ## Sinnvolle nächste Schritte
 
-1. TOML-Modelle und Validierung in einem Config-Adapter ergänzen; Agentenreferenzen und doppelte Step-IDs beim Laden prüfen.
+1. YAML-/TOML-Modelle und Validierung in einem Config-Adapter ergänzen; Agentenreferenzen und doppelte Step-IDs beim Laden prüfen.
 2. Workflow-Ausführung im Application-Layer auf Basis von `factory-core` implementieren.
 3. Einen Agenten- und Shell-Runner als Adapter hinzufügen und mit kleinen Integrationstests absichern.
 4. CLI zum Starten und Anzeigen eines Pipeline-Runs ergänzen; Pi- und HTTP-Integrationen können danach denselben Application-Port nutzen.
