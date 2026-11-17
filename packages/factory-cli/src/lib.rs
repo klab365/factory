@@ -232,7 +232,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("factory-cli-memory-{unique}"));
+        let root = std::env::temp_dir().join(format!("factory-memory-{unique}"));
         let agents = [agent("coder"), agent("reviewer")];
         let pipeline = Pipeline {
             name: "feature".into(),
