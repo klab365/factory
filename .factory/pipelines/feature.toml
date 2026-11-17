@@ -29,5 +29,5 @@ target_step = "test"
 [[steps]]
 id = "test"
 type = "shell"
-command = "cargo"
-args = ["test", "--workspace"]
+command = "mise"
+args = ["test"]
