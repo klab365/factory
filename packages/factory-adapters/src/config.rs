@@ -3,7 +3,9 @@
 use std::{
     collections::HashSet,
     error::Error,
-    fmt, fs,
+    fmt,
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -83,9 +85,9 @@ pub fn write_and_load_snapshot(
         path: path.to_owned(),
         message: format!("could not serialize configuration snapshot: {error}"),
     })?;
-    fs::write(path, json).map_err(|error| ConfigError {
+    write_atomic(path, &json).map_err(|error| ConfigError {
         path: path.to_owned(),
-        message: format!("could not write configuration snapshot: {error}"),
+        message: format!("could not atomically write configuration snapshot: {error}"),
     })?;
     load_configuration_snapshot(path)
 }
@@ -130,6 +132,20 @@ pub fn load_configuration_snapshot(path: impl AsRef<Path>) -> Result<Configurati
         .map(|dto| validate_pipeline(dto, path, &agents))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Configuration { agents, pipelines })
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let temporary = parent.join(format!(".snapshot-{}.tmp", std::process::id()));
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::rename(&temporary, path)?;
+    fs::File::open(parent)?.sync_all()
 }
 
 fn toml_files(dir: &Path) -> Result<Vec<PathBuf>, ConfigError> {

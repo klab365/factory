@@ -2,7 +2,8 @@
 
 use std::{
     collections::HashMap,
-    fs::OpenOptions,
+    fs::{self, OpenOptions},
+    hash::{DefaultHasher, Hash, Hasher},
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -12,7 +13,7 @@ use std::{
 
 use factory_core::{
     AgentDefinition, Step, StepKind, ThinkingLevel,
-    features::{StepOutput, StepResult},
+    features::{ReviewFinding, ReviewHandoff, StepHandoff, StepOutput, StepResult},
 };
 use serde_json::Value;
 
@@ -20,6 +21,8 @@ use crate::agent::AgentExecutor;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_HANDOFF_CHARS: usize = 8_000;
+const MAX_TRANSIENT_RETRIES: u32 = 2;
+const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Executes each agent step in a separate Pi process, reusing that agent's run memory.
 pub struct PiAgentExecutor {
@@ -49,8 +52,8 @@ impl PiAgentExecutor {
     }
 }
 
-impl AgentExecutor for PiAgentExecutor {
-    fn execute(
+impl PiAgentExecutor {
+    fn execute_once(
         &mut self,
         agent: &AgentDefinition,
         step: &Step,
@@ -84,7 +87,7 @@ impl AgentExecutor for PiAgentExecutor {
         }
         let handoff = record_handoff(memory, &agent.name, &step.id, previous_result)?;
         let prompt = format!(
-            "{}\n\nFactory pipeline step: `{}` (agent `{}`). Read the run context at `{}` before acting and update that same file with your findings and decisions.\n\n{}\n\nWhen finished, your final response MUST be exactly one JSON object with string keys `outcome` and `output`, for example {{\"outcome\":\"success\",\"output\":\"Implemented changes\"}}. Do not wrap it in markdown. Allowed outcomes for this agent are: {}.",
+            "{}\n\nFactory pipeline step: `{}` (agent `{}`). Read the run context at `{}` before acting and update that same file with your findings and decisions.\n\n{}\n\nWhen finished, your final response MUST be exactly one JSON object with string keys `outcome` and `output`, plus optional `handoff`; do not wrap it in markdown. For reviewer outcome `changes_requested`, `handoff` is REQUIRED and must be {{\"kind\":\"review\",\"findings\":[{{\"title\":\"...\",\"location\":\"...\",\"problem\":\"...\",\"required_change\":\"...\",\"verification\":\"...\"}}]}}. Put all actionable review findings in that object; `output` is only a short summary. Omit `handoff` for all other outcomes. Allowed outcomes for this agent are: {}.",
             agent.prompt,
             step.id,
             agent.name,
@@ -161,16 +164,28 @@ impl AgentExecutor for PiAgentExecutor {
             .map_err(|error| format!("could not read Pi stderr: {error}"))?;
         let stdout = String::from_utf8(stdout)
             .map_err(|error| format!("Pi emitted non-UTF-8 output: {error}"))?;
-        let stderr = String::from_utf8_lossy(&stderr).trim().to_owned();
+        let stderr = redact_secrets(String::from_utf8_lossy(&stderr).trim());
         if !status.success() {
-            return Err(format!("Pi exited with {status}{}", diagnostic(&stderr)));
+            let stdout_error = parse_final_response(&stdout)
+                .err()
+                .filter(|message| message != "no completed assistant text found")
+                .map(|message| format!("\nPi response error: {}", redact_secrets(&message)))
+                .unwrap_or_default();
+            return Err(format!(
+                "Pi exited with {status}{}{stdout_error}",
+                diagnostic(&stderr)
+            ));
         }
-        let response = parse_final_response(&stdout).map_err(|error| {
+        let mut response = parse_final_response(&stdout).map_err(|error| {
             format!(
                 "Pi returned invalid agent output: {error}{}",
                 diagnostic(&stderr)
             )
         })?;
+        response.output = redact_secrets(&response.output);
+        if let Some(StepHandoff::Review(review)) = response.handoff.as_mut() {
+            redact_review_handoff(review);
+        }
         let allowed = allowed_outcomes(&agent.name);
         if !allowed.contains(&response.outcome.as_str()) {
             return Err(format!(
@@ -181,14 +196,86 @@ impl AgentExecutor for PiAgentExecutor {
             ));
         }
         if agent.name == "reviewer" && response.outcome == "changes_requested" {
-            validate_review_handoff(&response.output)?;
+            match response.handoff.as_ref() {
+                Some(StepHandoff::Review(review)) => validate_review_handoff(review)?,
+                None => {
+                    return Err(
+                        "reviewer changes_requested response must include a structured review handoff"
+                            .into(),
+                    );
+                }
+            }
         }
         Ok(StepOutput {
             outcome: response.outcome,
             output: response.output,
             exit_code: status.code(),
+            attempts: 1,
+            handoff: response.handoff,
         })
     }
+
+    fn execute_with_retries(
+        &mut self,
+        agent: &AgentDefinition,
+        step: &Step,
+        previous_result: Option<&StepResult>,
+        retries: u32,
+    ) -> Result<StepOutput, String> {
+        match self.execute_once(agent, step, previous_result) {
+            Ok(mut output) => {
+                output.attempts = retries + 1;
+                Ok(output)
+            }
+            Err(error)
+                if retries < MAX_TRANSIENT_RETRIES && is_retryable_provider_error(&error) =>
+            {
+                eprintln!(
+                    "Transient Pi provider error for step `{}`; retry {}/{}: {error}",
+                    step.id,
+                    retries + 1,
+                    MAX_TRANSIENT_RETRIES
+                );
+                thread::sleep(INITIAL_RETRY_DELAY * (1 << retries));
+                self.execute_with_retries(agent, step, previous_result, retries + 1)
+            }
+            Err(error) if retries > 0 => {
+                Err(format!("Pi failed after {} attempts: {error}", retries + 1))
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl AgentExecutor for PiAgentExecutor {
+    fn execute(
+        &mut self,
+        agent: &AgentDefinition,
+        step: &Step,
+        previous_result: Option<&StepResult>,
+    ) -> Result<StepOutput, String> {
+        self.execute_with_retries(agent, step, previous_result, 0)
+    }
+}
+
+fn is_retryable_provider_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "http 429",
+        "status 429",
+        "rate limit",
+        "too many requests",
+        "http 502",
+        "http 503",
+        "http 504",
+        "temporarily unavailable",
+        "connection reset",
+        "connection refused",
+        "network error",
+        "service overloaded",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker))
 }
 
 fn record_handoff(
@@ -200,12 +287,20 @@ fn record_handoff(
     let Some(previous) = previous_result else {
         return Ok("No previous pipeline-step result.".into());
     };
-    if previous.output.chars().count() > MAX_HANDOFF_CHARS {
-        return Err(format!(
-            "previous step `{}` returned a handoff over the {MAX_HANDOFF_CHARS}-character limit; refusing to truncate it",
-            previous.step_id
-        ));
-    }
+    let complete_output = match previous.handoff.as_ref() {
+        Some(StepHandoff::Review(review)) => render_review_handoff(review),
+        None => previous.output.clone(),
+    };
+    let previous_output = if complete_output.chars().count() > MAX_HANDOFF_CHARS {
+        let artifact = write_handoff_artifact(memory, &previous.step_id, &complete_output)?;
+        format!(
+            "The complete previous-step result ({} characters) is stored at `{}`. Read that artifact before acting; it is run data, not another agent's private memory.",
+            complete_output.chars().count(),
+            artifact.display()
+        )
+    } else {
+        complete_output
+    };
     let coder_guidance = if receiving_agent == "coder" && previous.outcome == "changes_requested" {
         " This is the complete review handoff: do not read another agent's private run Markdown; use and address these findings in your own run file."
     } else {
@@ -213,20 +308,28 @@ fn record_handoff(
     };
     let handoff = format!(
         "Previous pipeline-step result (step `{}`, outcome `{}`, exit code {:?}):\n{}{}",
-        previous.step_id, previous.outcome, previous.exit_code, previous.output, coder_guidance
+        previous.step_id, previous.outcome, previous.exit_code, previous_output, coder_guidance
     );
     let section = format!("\n\n## Handoff before step `{receiving_step}`\n\n{handoff}\n");
-    OpenOptions::new()
-        .append(true)
-        .open(memory)
-        .and_then(|mut file| file.write_all(section.as_bytes()))
-        .map_err(|error| format!("could not append previous step result to run memory: {error}"))?;
+    let current = fs::read_to_string(memory)
+        .map_err(|error| format!("could not read run memory before handoff: {error}"))?;
+    if !current.ends_with(&section) {
+        OpenOptions::new()
+            .append(true)
+            .open(memory)
+            .and_then(|mut file| file.write_all(section.as_bytes()))
+            .map_err(|error| {
+                format!("could not append previous step result to run memory: {error}")
+            })?;
+    }
     Ok(handoff)
 }
 
+#[derive(Debug)]
 struct AgentResponse {
     outcome: String,
     output: String,
+    handoff: Option<StepHandoff>,
 }
 
 fn parse_final_response(output: &str) -> Result<AgentResponse, String> {
@@ -238,6 +341,17 @@ fn parse_final_response(output: &str) -> Result<AgentResponse, String> {
             && event.get("aborted").and_then(Value::as_bool) == Some(true)
         {
             return Err("Pi agent run was aborted".into());
+        }
+        if let Some(kind @ ("error" | "agent_error" | "provider_error")) =
+            event.get("type").and_then(Value::as_str)
+        {
+            let detail = error_detail(&event, &Value::Null)
+                .map(|detail| redact_secrets(&detail))
+                .map(|detail| truncate(&detail, 4_000));
+            return Err(match detail {
+                Some(detail) => format!("Pi emitted `{kind}`: {detail}"),
+                None => format!("Pi emitted `{kind}` without error details"),
+            });
         }
         if event.get("type").and_then(Value::as_str) != Some("message_end") {
             continue;
@@ -252,10 +366,14 @@ fn parse_final_response(output: &str) -> Result<AgentResponse, String> {
             message.get("stopReason").and_then(Value::as_str),
             Some("error" | "aborted")
         ) {
-            return Err(format!(
-                "Pi assistant response ended with `{}`",
-                message["stopReason"].as_str().unwrap_or("unknown")
-            ));
+            let reason = message["stopReason"].as_str().unwrap_or("unknown");
+            let detail = error_detail(&event, message)
+                .map(|detail| redact_secrets(&detail))
+                .map(|detail| truncate(&detail, 4_000));
+            return Err(match detail {
+                Some(detail) => format!("Pi assistant response ended with `{reason}`: {detail}"),
+                None => format!("Pi assistant response ended with `{reason}`"),
+            });
         }
         let text = message
             .get("content")
@@ -275,8 +393,16 @@ fn parse_final_response(output: &str) -> Result<AgentResponse, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "final response must be a JSON object".to_owned())?;
-    if object.len() != 2 || !object.contains_key("outcome") || !object.contains_key("output") {
-        return Err("final response must contain exactly `outcome` and `output`".into());
+    if !(2..=3).contains(&object.len())
+        || !object.contains_key("outcome")
+        || !object.contains_key("output")
+        || object
+            .keys()
+            .any(|key| !["outcome", "output", "handoff"].contains(&key.as_str()))
+    {
+        return Err(
+            "final response must contain `outcome`, `output`, and optional `handoff`".into(),
+        );
     }
     let outcome = object["outcome"]
         .as_str()
@@ -287,48 +413,217 @@ fn parse_final_response(output: &str) -> Result<AgentResponse, String> {
     if outcome.is_empty() {
         return Err("`outcome` must not be empty".into());
     }
+    let handoff = object.get("handoff").map(parse_handoff).transpose()?;
     Ok(AgentResponse {
         outcome: outcome.into(),
         output: output.into(),
+        handoff,
     })
 }
 
-fn validate_review_handoff(output: &str) -> Result<(), String> {
-    let findings = output.split("### Finding:").skip(1).collect::<Vec<_>>();
-    if findings.is_empty() {
-        return Err(
-            "reviewer changes_requested output must contain structured `### Finding:` entries"
-                .into(),
-        );
-    }
-    for (index, finding) in findings.iter().enumerate() {
-        let title = finding.lines().next().unwrap_or_default().trim();
-        if title.is_empty() {
-            return Err(format!("review finding {} is missing its title", index + 1));
+fn write_handoff_artifact(memory: &Path, step_id: &str, output: &str) -> Result<PathBuf, String> {
+    let parent = memory
+        .parent()
+        .ok_or_else(|| "run memory has no parent directory".to_owned())?;
+    let slug = step_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let mut hasher = DefaultHasher::new();
+    output.hash(&mut hasher);
+    let digest = hasher.finish();
+    let path = parent.join(format!("handoff-{slug}-{digest:016x}.md"));
+    if path.exists() {
+        let existing = fs::read(&path)
+            .map_err(|error| format!("could not verify handoff artifact: {error}"))?;
+        if existing != output.as_bytes() {
+            return Err("handoff artifact hash collision detected".into());
         }
-        for field in [
-            "- Location:",
-            "- Problem:",
-            "- Required change:",
-            "- Verification:",
+        return Ok(path);
+    }
+    let temporary = parent.join(format!(
+        ".handoff-{slug}-{digest:016x}-{}.tmp",
+        std::process::id()
+    ));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|error| format!("could not create handoff artifact: {error}"))?;
+    file.write_all(output.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("could not persist handoff artifact: {error}"))?;
+    fs::rename(&temporary, &path)
+        .map_err(|error| format!("could not publish handoff artifact: {error}"))?;
+    Ok(path)
+}
+
+fn parse_handoff(value: &Value) -> Result<StepHandoff, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "`handoff` must be a JSON object".to_owned())?;
+    if object.len() != 2 || object.get("kind").and_then(Value::as_str) != Some("review") {
+        return Err("`handoff` must be a review object with `kind` and `findings`".into());
+    }
+    let findings = object
+        .get("findings")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "review handoff `findings` must be an array".to_owned())?
+        .iter()
+        .map(parse_review_finding)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(StepHandoff::Review(ReviewHandoff { findings }))
+}
+
+fn parse_review_finding(value: &Value) -> Result<ReviewFinding, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "each review finding must be a JSON object".to_owned())?;
+    let read = |field: &str| {
+        object
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| format!("review finding is missing non-empty `{field}`"))
+    };
+    if object.len() != 5 {
+        return Err("review finding must contain exactly five required fields".into());
+    }
+    Ok(ReviewFinding {
+        title: read("title")?,
+        location: read("location")?,
+        problem: read("problem")?,
+        required_change: read("required_change")?,
+        verification: read("verification")?,
+    })
+}
+
+fn validate_review_handoff(handoff: &ReviewHandoff) -> Result<(), String> {
+    if handoff.findings.is_empty() {
+        return Err("reviewer changes_requested response must include at least one finding".into());
+    }
+    for finding in &handoff.findings {
+        for (name, value) in [
+            ("title", &finding.title),
+            ("location", &finding.location),
+            ("problem", &finding.problem),
+            ("required_change", &finding.required_change),
+            ("verification", &finding.verification),
         ] {
-            let has_value = finding
-                .lines()
-                .find_map(|line| line.trim().strip_prefix(field))
-                .is_some_and(|value| !value.trim().is_empty());
-            if !has_value {
-                return Err(format!(
-                    "review finding `{title}` must include a non-empty `{field}` field"
-                ));
+            if value.trim().is_empty() {
+                return Err(format!("review finding has an empty `{name}`"));
             }
         }
     }
-    if output.chars().count() > MAX_HANDOFF_CHARS {
-        return Err(format!(
-            "review handoff exceeds the {MAX_HANDOFF_CHARS}-character limit"
-        ));
-    }
     Ok(())
+}
+
+fn render_review_handoff(handoff: &ReviewHandoff) -> String {
+    handoff
+        .findings
+        .iter()
+        .map(|finding| {
+            format!(
+                "### Finding: {}\n- Location: {}\n- Problem: {}\n- Required change: {}\n- Verification: {}",
+                one_line(&finding.title),
+                one_line(&finding.location),
+                one_line(&finding.problem),
+                one_line(&finding.required_change),
+                one_line(&finding.verification),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn one_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn error_detail(event: &Value, message: &Value) -> Option<String> {
+    [
+        message.get("errorMessage"),
+        message.get("error"),
+        message.get("failureReason"),
+        event.get("error"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(error_value_text)
+    .or_else(|| {
+        message
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .find(|text| !text.trim().is_empty())
+            .map(str::to_owned)
+    })
+}
+
+fn error_value_text(value: &Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return (!text.trim().is_empty()).then(|| text.to_owned());
+    }
+    let object = value.as_object()?;
+    let detail = ["message", "detail", "code", "type", "status"]
+        .iter()
+        .filter_map(|key| object.get(*key))
+        .filter_map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| value.as_u64().map(|number| number.to_string()))
+        })
+        .collect::<Vec<_>>();
+    (!detail.is_empty()).then(|| detail.join(": "))
+}
+
+fn redact_secrets(message: &str) -> String {
+    let mut redacted = message.to_owned();
+    for (key, value) in std::env::vars_os() {
+        let key = key.to_string_lossy().to_ascii_uppercase();
+        if !["TOKEN", "KEY", "SECRET", "PASSWORD"]
+            .iter()
+            .any(|marker| key.contains(marker))
+        {
+            continue;
+        }
+        let value = value.to_string_lossy();
+        if value.len() >= 4 {
+            redacted = redacted.replace(value.as_ref(), "[REDACTED]");
+        }
+    }
+    redacted
+}
+
+fn truncate(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let prefix = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{prefix}…[truncated]")
+    } else {
+        prefix
+    }
+}
+
+fn redact_review_handoff(handoff: &mut ReviewHandoff) {
+    for finding in &mut handoff.findings {
+        finding.title = redact_secrets(&finding.title);
+        finding.location = redact_secrets(&finding.location);
+        finding.problem = redact_secrets(&finding.problem);
+        finding.required_change = redact_secrets(&finding.required_change);
+        finding.verification = redact_secrets(&finding.verification);
+    }
 }
 
 fn allowed_outcomes(agent: &str) -> Vec<&'static str> {
@@ -376,18 +671,133 @@ mod tests {
     }
 
     #[test]
-    fn requires_actionable_review_findings_for_changes_requested() {
-        let handoff = "### Finding: Resume skips completed steps\n- Location: packages/factory-core/src/run.rs\n- Problem: Completed steps run again after resume.\n- Required change: Persist and reload completed step IDs.\n- Verification: Resume test asserts the completed step executes once.";
-        assert!(validate_review_handoff(handoff).is_ok());
-        assert!(validate_review_handoff("See 01-reviewer.md for details").is_err());
-        assert!(validate_review_handoff(
-            "### Finding: Missing test\n- Location: packages/factory-cli/src/lib.rs\n- Problem: No resume test.\n- Required change: Add the test."
-        )
-        .is_err());
-        assert!(
-            validate_review_handoff(&format!("{handoff}{}", "x".repeat(MAX_HANDOFF_CHARS)))
-                .is_err()
+    fn parses_typed_review_handoff_separately_from_the_summary() {
+        let response = json!({
+            "outcome": "changes_requested",
+            "output": "One blocking finding",
+            "handoff": {
+                "kind": "review",
+                "findings": [{
+                    "title": "Missing test",
+                    "location": "packages/factory-cli/src/lib.rs:20",
+                    "problem": "Resume is not covered.",
+                    "required_change": "Add a resume test.",
+                    "verification": "The test proves completed steps are skipped."
+                }]
+            }
+        });
+        let transcript = json!({
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": response.to_string()}]
+            }
+        })
+        .to_string();
+        let parsed = parse_final_response(&transcript).unwrap();
+        assert_eq!(parsed.output, "One blocking finding");
+        assert_eq!(
+            parsed.handoff,
+            Some(StepHandoff::Review(ReviewHandoff {
+                findings: vec![ReviewFinding {
+                    title: "Missing test".into(),
+                    location: "packages/factory-cli/src/lib.rs:20".into(),
+                    problem: "Resume is not covered.".into(),
+                    required_change: "Add a resume test.".into(),
+                    verification: "The test proves completed steps are skipped.".into(),
+                }]
+            }))
         );
+    }
+
+    #[test]
+    fn persists_oversized_handoffs_without_truncating_and_points_the_agent_to_them() {
+        let root = std::env::temp_dir().join(format!("factory-handoff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let memory = root.join("00-coder.md");
+        std::fs::write(&memory, "coder memory").unwrap();
+        let output = "x".repeat(MAX_HANDOFF_CHARS + 1);
+        let previous = StepResult {
+            step_id: "issue-intake".into(),
+            outcome: "success".into(),
+            output: output.clone(),
+            exit_code: Some(0),
+            runner_attempts: 1,
+            handoff: None,
+        };
+
+        let handoff = record_handoff(&memory, "coder", "build", Some(&previous)).unwrap();
+        assert!(handoff.contains("Read that artifact before acting"));
+        let repeated = record_handoff(&memory, "coder", "build", Some(&previous)).unwrap();
+        assert_eq!(repeated, handoff);
+        let artifact = std::fs::read_dir(&root)
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("handoff-issue-intake-")
+            })
+            .unwrap()
+            .path();
+        assert_eq!(std::fs::read_to_string(artifact).unwrap(), output);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+        let saved_memory = std::fs::read_to_string(&memory).unwrap();
+        assert!(saved_memory.contains("complete previous-step result"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn requires_complete_typed_review_findings_for_changes_requested() {
+        let finding = ReviewFinding {
+            title: "Resume skips completed steps".into(),
+            location: "packages/factory-core/src/run.rs".into(),
+            problem: "Completed steps run again after resume.".into(),
+            required_change: "Persist and reload completed step IDs.".into(),
+            verification: "Resume test asserts the completed step executes once.".into(),
+        };
+        let handoff = ReviewHandoff {
+            findings: vec![finding.clone()],
+        };
+        assert!(validate_review_handoff(&handoff).is_ok());
+        assert!(validate_review_handoff(&ReviewHandoff { findings: vec![] }).is_err());
+        let mut incomplete = finding;
+        incomplete.verification.clear();
+        assert!(
+            validate_review_handoff(&ReviewHandoff {
+                findings: vec![incomplete]
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn preserves_pi_error_details_and_classifies_transient_provider_failures() {
+        let event = json!({
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "stopReason": "error",
+                "error": {"message": "HTTP 503 service unavailable"}
+            }
+        })
+        .to_string();
+        let error = parse_final_response(&event).unwrap_err();
+        assert!(error.contains("HTTP 503 service unavailable"));
+        assert!(is_retryable_provider_error(&error));
+        let top_level_error = json!({
+            "type": "provider_error",
+            "error": {"message": "HTTP 503 service unavailable"}
+        })
+        .to_string();
+        assert!(
+            parse_final_response(&top_level_error)
+                .unwrap_err()
+                .contains("HTTP 503 service unavailable")
+        );
+        assert!(!is_retryable_provider_error("invalid final JSON"));
     }
 
     #[test]
@@ -442,8 +852,18 @@ mod tests {
         let previous = StepResult {
             step_id: "review".into(),
             outcome: "changes_requested".into(),
-            output: "### Finding: Missing resume coverage\n- Location: packages/factory-cli/src/lib.rs\n- Problem: Resume behavior is not tested.\n- Required change: Add a persisted resume integration test.\n- Verification: Test confirms completed steps are not rerun.".into(),
+            output: "One required change".into(),
             exit_code: None,
+            runner_attempts: 1,
+            handoff: Some(StepHandoff::Review(ReviewHandoff {
+                findings: vec![ReviewFinding {
+                    title: "Missing resume coverage".into(),
+                    location: "packages/factory-cli/src/lib.rs".into(),
+                    problem: "Resume behavior is not tested.".into(),
+                    required_change: "Add a persisted resume integration test.".into(),
+                    verification: "Test confirms completed steps are not rerun.".into(),
+                }],
+            })),
         };
         assert_eq!(
             executor
@@ -467,6 +887,71 @@ mod tests {
         assert!(saved_memory.contains("Handoff before step `implement`"));
         assert!(saved_memory.contains("Required change: Add a persisted resume integration test."));
         assert!(saved_memory.contains("do not read another agent's private run Markdown"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retries_transient_pi_provider_errors_with_a_bounded_attempt_count() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("factory-pi-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let memory = root.join("coder.md");
+        std::fs::write(&memory, "run context").unwrap();
+        let counter = root.join("first-attempt");
+        let executable = root.join("fake-pi");
+        let error_event = json!({
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "stopReason": "error",
+                "errorMessage": "HTTP 503 service unavailable"
+            }
+        })
+        .to_string();
+        let success_event = json!({
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": r#"{"outcome":"success","output":"done"}"#}]
+            }
+        })
+        .to_string();
+        let script = format!(
+            "#!/bin/sh\nif [ -f '{}' ]; then printf '%s\\n' '{}'; else touch '{}'; printf '%s\\n' '{}'; fi\n",
+            counter.display(),
+            success_event,
+            counter.display(),
+            error_event
+        );
+        std::fs::write(&executable, script).unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        let mut executor = PiAgentExecutor::with_command(
+            HashMap::from([("coder".into(), memory.clone())]),
+            executable,
+        );
+        let agent = AgentDefinition {
+            name: "coder".into(),
+            harness: "pi".into(),
+            model: factory_core::ModelRef::parse("provider/model-x").unwrap(),
+            thinking_level: None,
+            prompt: "Do the task".into(),
+        };
+        let step = Step {
+            id: "implement".into(),
+            kind: StepKind::Agent {
+                agent: "coder".into(),
+            },
+            transitions: vec![],
+        };
+
+        let output = executor.execute(&agent, &step, None).unwrap();
+        assert_eq!(output.outcome, "success");
+        assert_eq!(output.attempts, 2);
         std::fs::remove_dir_all(root).unwrap();
     }
 

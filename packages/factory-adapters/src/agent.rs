@@ -70,6 +70,8 @@ mod tests {
                 outcome: "success".into(),
                 output: "done".into(),
                 exit_code: None,
+                attempts: 1,
+                handoff: None,
             })
         }
     }

@@ -2,7 +2,7 @@
 
 use crate::{AgentDefinition, Step};
 
-use super::run::StepResult;
+use super::run::{StepHandoff, StepResult};
 
 /// A structured result returned by a step runner.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10,6 +10,9 @@ pub struct StepOutput {
     pub outcome: String,
     pub output: String,
     pub exit_code: Option<i32>,
+    /// Number of adapter-level attempts used to produce this result.
+    pub attempts: u32,
+    pub handoff: Option<StepHandoff>,
 }
 
 /// Port for executing an agent step. Implementations belong in adapters.
@@ -26,4 +29,11 @@ pub trait AgentRunner {
 /// Port for executing a shell step. Implementations belong in adapters.
 pub trait ShellRunner {
     fn run(&mut self, step: &Step) -> Result<StepOutput, String>;
+}
+
+/// Persistence port called before and after each step execution.
+pub trait RunJournal {
+    fn step_started(&mut self, step_id: &str) -> Result<(), String>;
+    fn step_completed(&mut self, result: &StepResult) -> Result<(), String>;
+    fn step_failed(&mut self, step_id: &str, error: &str) -> Result<(), String>;
 }
