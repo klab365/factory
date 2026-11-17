@@ -82,7 +82,16 @@ fn run_new_pipeline(pipeline_name: &str, task: &str, inputs: HashMap<String, Str
             return EXIT_CONFIGURATION_ERROR;
         }
     };
-    let source_configuration = match load_configuration(&root) {
+    run_new_pipeline_from_root(&root, pipeline_name, task, inputs)
+}
+
+fn run_new_pipeline_from_root(
+    root: &std::path::Path,
+    pipeline_name: &str,
+    task: &str,
+    inputs: HashMap<String, String>,
+) -> u8 {
+    let source_configuration = match load_configuration(root) {
         Ok(configuration) => configuration,
         Err(error) => {
             eprintln!("Configuration error: {error}");
@@ -116,7 +125,7 @@ fn run_new_pipeline(pipeline_name: &str, task: &str, inputs: HashMap<String, Str
         eprintln!("Input error: {error}");
         return EXIT_USAGE_ERROR;
     }
-    let run_dir = match create_run_dir(&root) {
+    let run_dir = match create_run_dir(root) {
         Ok(path) => path,
         Err(error) => {
             eprintln!("Could not initialize run directory: {error}");
@@ -177,20 +186,15 @@ fn run_new_pipeline(pipeline_name: &str, task: &str, inputs: HashMap<String, Str
         println!("Agent memory: {}", path.display());
     }
     let mut agent_runner = AgentRunnerAdapter::new(PiAgentExecutor::new(memory_paths));
-    let mut shell_runner = ShellRunnerAdapter::new(shell_config(&root, inputs));
-    let result = {
-        let mut journal = ConsoleRunJournal::new(&mut store);
-        run_pipeline_with_journal(
-            pipeline,
-            &configuration.agents,
-            &mut agent_runner,
-            &mut shell_runner,
-            &[],
-            &mut journal,
-            MAX_STEP_EXECUTIONS,
-        )
-    };
-    finish_pipeline_result(&mut store, result)
+    let mut shell_runner = ShellRunnerAdapter::new(shell_config(root, inputs));
+    execute_pipeline_and_finish(
+        &mut store,
+        pipeline,
+        &configuration.agents,
+        &mut agent_runner,
+        &mut shell_runner,
+        &[],
+    )
 }
 
 fn run_management_command(args: &[String]) -> u8 {
@@ -319,22 +323,47 @@ fn resume_run(
     let mut shell_runner =
         ShellRunnerAdapter::new(shell_config(root, store.record().inputs.clone()));
     let completed = store.completed_results();
+    execute_pipeline_and_finish(
+        store,
+        pipeline,
+        &configuration.agents,
+        &mut agent_runner,
+        &mut shell_runner,
+        &completed,
+    )
+}
+
+fn execute_pipeline_and_finish<
+    A: factory_core::features::AgentRunner,
+    S: factory_core::features::ShellRunner,
+>(
+    store: &mut RunStore,
+    pipeline: &Pipeline,
+    agents: &[factory_core::AgentDefinition],
+    agent_runner: &mut A,
+    shell_runner: &mut S,
+    completed: &[StepResult],
+) -> u8 {
     let result = {
         let mut journal = ConsoleRunJournal::new(store);
         run_pipeline_with_journal(
             pipeline,
-            &configuration.agents,
-            &mut agent_runner,
-            &mut shell_runner,
-            &completed,
+            agents,
+            agent_runner,
+            shell_runner,
+            completed,
             &mut journal,
             MAX_STEP_EXECUTIONS,
         )
     };
-    finish_pipeline_result(store, result)
+    finish_pipeline_result(store, result, pipeline)
 }
 
-fn finish_pipeline_result(store: &mut RunStore, result: Result<RunReport, RunError>) -> u8 {
+fn finish_pipeline_result(
+    store: &mut RunStore,
+    result: Result<RunReport, RunError>,
+    pipeline: &Pipeline,
+) -> u8 {
     match result {
         Ok(report) => {
             let status = match report.status {
@@ -345,7 +374,7 @@ fn finish_pipeline_result(store: &mut RunStore, result: Result<RunReport, RunErr
                 eprintln!("Could not persist final run status: {error}");
                 return EXIT_EXECUTION_ERROR;
             }
-            print_report(&report)
+            print_report(&report, pipeline)
         }
         Err(error) => {
             eprintln!("Execution error: {error}");
@@ -570,7 +599,7 @@ impl RunJournal for ConsoleRunJournal<'_> {
     }
 }
 
-fn print_report(report: &RunReport) -> u8 {
+fn print_report(report: &RunReport, pipeline: &Pipeline) -> u8 {
     for step in &report.steps {
         println!("Step `{}`: {}", step.step_id, step.outcome);
         if let Some(exit_code) = step.exit_code {
@@ -593,8 +622,25 @@ fn print_report(report: &RunReport) -> u8 {
                 "Pipeline `{}` failed (review or step outcome)",
                 report.pipeline_name
             );
-            EXIT_REVIEW_FAILED
+            terminal_failure_exit_code(report, pipeline)
         }
+    }
+}
+
+fn terminal_failure_exit_code(report: &RunReport, pipeline: &Pipeline) -> u8 {
+    let Some(terminal) = report.steps.last() else {
+        return EXIT_EXECUTION_ERROR;
+    };
+    let Some(step) = pipeline
+        .steps
+        .iter()
+        .find(|step| step.id == terminal.step_id)
+    else {
+        return EXIT_EXECUTION_ERROR;
+    };
+    match step.kind {
+        StepKind::Shell { .. } => EXIT_EXECUTION_ERROR,
+        StepKind::Agent { .. } => EXIT_REVIEW_FAILED,
     }
 }
 
@@ -632,19 +678,163 @@ mod tests {
 
     #[test]
     fn distinguishes_terminal_failure_from_execution_errors() {
+        let pipeline = Pipeline {
+            name: "review".into(),
+            inputs: vec![],
+            steps: vec![agent_step("review", "reviewer")],
+        };
         let report = RunReport {
             pipeline_name: "review".into(),
             status: RunStatus::Failed,
-            steps: vec![],
+            steps: vec![StepResult {
+                step_id: "review".into(),
+                outcome: "failure".into(),
+                output: String::new(),
+                exit_code: None,
+                runner_attempts: 1,
+                handoff: None,
+            }],
         };
-        assert_eq!(print_report(&report), EXIT_REVIEW_FAILED);
+        assert_eq!(print_report(&report, &pipeline), EXIT_REVIEW_FAILED);
+        let shell_pipeline = Pipeline {
+            name: "shell".into(),
+            inputs: vec![],
+            steps: vec![Step {
+                id: "command".into(),
+                kind: StepKind::Shell {
+                    command: "false".into(),
+                    args: vec![],
+                },
+                transitions: vec![],
+            }],
+        };
+        let shell_report = RunReport {
+            pipeline_name: "shell".into(),
+            status: RunStatus::Failed,
+            steps: vec![StepResult {
+                step_id: "command".into(),
+                outcome: "failure".into(),
+                output: String::new(),
+                exit_code: Some(1),
+                runner_attempts: 1,
+                handoff: None,
+            }],
+        };
         assert_eq!(
-            execution_exit_code(Err(RunError::RunnerFailed {
-                step_id: "test".into(),
-                message: "failed".into(),
-            })),
+            print_report(&shell_report, &shell_pipeline),
             EXIT_EXECUTION_ERROR
         );
+        assert_eq!(
+            terminal_failure_exit_code(
+                &report,
+                &Pipeline {
+                    steps: vec![],
+                    ..pipeline.clone()
+                }
+            ),
+            EXIT_EXECUTION_ERROR
+        );
+        let unknown_report = RunReport {
+            steps: vec![StepResult {
+                step_id: "unknown".into(),
+                ..report.steps[0].clone()
+            }],
+            ..report.clone()
+        };
+        assert_eq!(
+            terminal_failure_exit_code(&unknown_report, &pipeline),
+            EXIT_EXECUTION_ERROR
+        );
+        let success = RunReport {
+            status: RunStatus::Succeeded,
+            ..report
+        };
+        assert_eq!(print_report(&success, &pipeline), EXIT_SUCCESS);
+    }
+
+    #[test]
+    fn configuration_errors_return_exit_code_two_from_pipeline_entrypoint() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("factory-config-error-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        assert_eq!(
+            run_new_pipeline_from_root(&root, "missing", "task", HashMap::new()),
+            EXIT_CONFIGURATION_ERROR
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn productive_pipeline_execution_maps_shell_and_agent_failures_to_exit_codes() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("factory-exit-codes-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let agent_pipeline = Pipeline {
+            name: "review".into(),
+            inputs: vec![],
+            steps: vec![agent_step("review", "reviewer")],
+        };
+        let mut store = test_store(&root, "review");
+        let mut agents = FailedAgent;
+        let mut shell = FailedShell;
+        assert_eq!(
+            execute_pipeline_and_finish(
+                &mut store,
+                &agent_pipeline,
+                &[agent("reviewer")],
+                &mut agents,
+                &mut shell,
+                &[],
+            ),
+            EXIT_REVIEW_FAILED
+        );
+
+        let shell_pipeline = Pipeline {
+            name: "shell".into(),
+            inputs: vec![],
+            steps: vec![Step {
+                id: "shell".into(),
+                kind: StepKind::Shell {
+                    command: "false".into(),
+                    args: vec![],
+                },
+                transitions: vec![],
+            }],
+        };
+        let mut store = test_store(&root, "shell");
+        let mut agents = FailedAgent;
+        let mut shell = ShellRunnerAdapter::new(shell_config(&root, HashMap::new()));
+        assert_eq!(
+            execute_pipeline_and_finish(
+                &mut store,
+                &shell_pipeline,
+                &[],
+                &mut agents,
+                &mut shell,
+                &[],
+            ),
+            EXIT_EXECUTION_ERROR
+        );
+
+        let mut store = test_store(&root, "runner");
+        assert_eq!(
+            finish_pipeline_result(
+                &mut store,
+                Err(RunError::RunnerFailed {
+                    step_id: "run".into(),
+                    message: "failed".into()
+                }),
+                &shell_pipeline,
+            ),
+            EXIT_EXECUTION_ERROR
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -797,6 +987,46 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    fn test_store(root: &std::path::Path, id: &str) -> factory_adapters::run_store::RunStore {
+        let run_dir = root.join(id);
+        fs::create_dir_all(&run_dir).unwrap();
+        RunStore::create(
+            &run_dir,
+            id.into(),
+            id.into(),
+            "test".into(),
+            HashMap::new(),
+        )
+        .unwrap()
+    }
+
+    struct FailedAgent;
+
+    impl factory_core::features::AgentRunner for FailedAgent {
+        fn run(
+            &mut self,
+            _agent: &factory_core::AgentDefinition,
+            _step: &Step,
+            _previous_result: Option<&StepResult>,
+        ) -> Result<factory_core::features::StepOutput, String> {
+            Ok(factory_core::features::StepOutput {
+                outcome: "failure".into(),
+                output: "review rejected".into(),
+                exit_code: None,
+                attempts: 1,
+                handoff: None,
+            })
+        }
+    }
+
+    struct FailedShell;
+
+    impl factory_core::features::ShellRunner for FailedShell {
+        fn run(&mut self, _step: &Step) -> Result<factory_core::features::StepOutput, String> {
+            Err("command failed".into())
+        }
+    }
+
     fn agent(name: &str) -> factory_core::AgentDefinition {
         factory_core::AgentDefinition {
             name: name.into(),
@@ -814,16 +1044,6 @@ mod tests {
                 agent: agent.into(),
             },
             transitions: vec![],
-        }
-    }
-
-    fn execution_exit_code(result: Result<RunReport, RunError>) -> u8 {
-        match result {
-            Ok(report) => print_report(&report),
-            Err(error) => {
-                eprintln!("Execution error: {error}");
-                EXIT_EXECUTION_ERROR
-            }
         }
     }
 }
