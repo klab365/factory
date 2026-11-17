@@ -477,18 +477,20 @@ mod tests {
     use super::*;
     use std::{
         fs,
-        time::{SystemTime, UNIX_EPOCH},
+        sync::atomic::{AtomicUsize, Ordering},
     };
+
+    static NEXT_TEMP_PROJECT: AtomicUsize = AtomicUsize::new(0);
 
     struct TempProject(PathBuf);
 
     impl TempProject {
         fn new() -> Self {
-            let unique = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!("factory-adapters-config-{unique}"));
+            let unique = NEXT_TEMP_PROJECT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "factory-adapters-config-{}-{unique}",
+                std::process::id()
+            ));
             fs::create_dir_all(path.join(".factory/agents")).unwrap();
             fs::create_dir_all(path.join(".factory/pipelines")).unwrap();
             Self(path)

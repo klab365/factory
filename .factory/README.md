@@ -9,7 +9,7 @@
 Die CLI führt nach dem Erstellen des Snapshots ausschließlich die daraus geladene Konfiguration aus. Agentenschritte starten Pi als separaten Prozess; Pi muss installiert und für die in den Agenten-TOML-Dateien konfigurierten Modelle eingerichtet sein. Start:
 
 ```bash
-cargo run -p factory-cli -- feature "Beschreibe hier die gewünschte Änderung."
+cargo run -p factory-cli --bin factory -- feature "Beschreibe hier die gewünschte Änderung."
 ```
 
 Shell-Steps starten echte Prozesse. Nur vertrauenswürdige Pipelines ausführen.

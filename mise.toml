@@ -9,6 +9,14 @@ run = "pi"
 description = "Führt die Rust-Tests aus"
 run = "cargo test --workspace"
 
+[tasks.lint]
+description = "Führt Clippy für den gesamten Workspace aus"
+run = "cargo clippy --workspace --all-targets -- -D warnings"
+
+[tasks.build]
+description = "Baut den gesamten Workspace"
+run = "cargo build --workspace"
+
 [tasks.fmt]
 description = "Prüft Rust-Formatierung"
 run = "cargo fmt --all -- --check"
