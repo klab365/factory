@@ -66,6 +66,108 @@ fn exit_code(output: Output) -> i32 {
 }
 
 #[test]
+fn validate_and_plan_do_not_execute_steps_or_create_run_artifacts() {
+    let fixture = Fixture::new();
+    fixture.pipeline("name = 'test'\n[[inputs]]\nkey = 'task'\ndescription = 'Task'\n[[steps]]\nid = 'agent-step'\ntype = 'agent'\nagent = 'worker'\n[[steps.transitions]]\noutcome = 'success'\ntarget_step = 'shell-step'\n[[steps]]\nid = 'shell-step'\ntype = 'shell'\ncommand = '/bin/touch'\nargs = ['marker']\n");
+    fs::write(fixture.root.join(".factory/agents/worker.toml"), "name = 'worker'\nharness = 'pi'\nmodel = 'test/model'\nthinking_level = 'off'\nprompt = 'test'\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_factory"))
+        .args(["plan", "test", "--input", "task=example"])
+        .current_dir(&fixture.root)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("agent-step (agent)"));
+    assert!(stdout.contains("shell-step (shell)"));
+    assert!(stdout.contains("success` -> `shell-step"));
+    assert!(!fixture.root.join("marker").exists());
+    let runs = fixture.root.join(".factory/runs");
+    assert!(!runs.exists());
+    let validation = Command::new(env!("CARGO_BIN_EXE_factory"))
+        .arg("validate")
+        .current_dir(&fixture.root)
+        .output()
+        .unwrap();
+    assert_eq!(
+        validation.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&validation.stderr)
+    );
+}
+
+#[test]
+fn validate_reports_configuration_file_and_actionable_error() {
+    let fixture = Fixture::new();
+    fixture.pipeline("name = 'test'\n[[inputs]]\nkey = 'task'\ndescription = 'Task'\n[[steps]]\nid = 'agent'\ntype = 'agent'\nagent = 'missing'\n");
+    let path = fixture.root.join(".factory/pipelines/test.toml");
+    let output = Command::new(env!("CARGO_BIN_EXE_factory"))
+        .arg("validate")
+        .current_dir(&fixture.root)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(path.to_str().unwrap()));
+    assert!(stderr.contains("unknown agent"));
+    assert!(stderr.contains("step `agent`"));
+}
+
+#[test]
+fn validate_rejects_unavailable_shell_outcomes_and_accepts_success_and_failure() {
+    let fixture = Fixture::new();
+    fixture.pipeline("name = 'test'\n[[inputs]]\nkey = 'task'\ndescription = 'Task'\n[[steps]]\nid = 'shell'\ntype = 'shell'\ncommand = 'true'\n[[steps.transitions]]\noutcome = 'typo'\ntarget_step = 'next'\n[[steps]]\nid = 'next'\ntype = 'shell'\ncommand = 'true'\n");
+
+    let invalid = Command::new(env!("CARGO_BIN_EXE_factory"))
+        .arg("validate")
+        .current_dir(&fixture.root)
+        .output()
+        .unwrap();
+    assert_eq!(invalid.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(stderr.contains("shell step `shell`"));
+    assert!(stderr.contains("unsupported transition outcome `typo`"));
+    assert!(stderr.contains("`success` or `failure`"));
+
+    fixture.pipeline("name = 'test'\n[[inputs]]\nkey = 'task'\ndescription = 'Task'\n[[steps]]\nid = 'shell'\ntype = 'shell'\ncommand = 'true'\n[[steps.transitions]]\noutcome = 'success'\ntarget_step = 'success-step'\n[[steps.transitions]]\noutcome = 'failure'\ntarget_step = 'failure-step'\n[[steps]]\nid = 'success-step'\ntype = 'shell'\ncommand = 'true'\n[[steps]]\nid = 'failure-step'\ntype = 'shell'\ncommand = 'true'\n");
+    let valid = Command::new(env!("CARGO_BIN_EXE_factory"))
+        .arg("validate")
+        .current_dir(&fixture.root)
+        .output()
+        .unwrap();
+    assert_eq!(
+        valid.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&valid.stderr)
+    );
+}
+
+#[test]
+fn plan_reports_unknown_pipeline_and_missing_inputs() {
+    let fixture = Fixture::new();
+    fixture.pipeline("name = 'test'\n[[inputs]]\nkey = 'task'\ndescription = 'Task'\n[[steps]]\nid = 'shell'\ntype = 'shell'\ncommand = 'true'\n");
+    let command = |pipeline: &str| {
+        Command::new(env!("CARGO_BIN_EXE_factory"))
+            .args(["plan", pipeline])
+            .current_dir(&fixture.root)
+            .output()
+            .unwrap()
+    };
+    let missing_pipeline = command("unknown");
+    assert_eq!(missing_pipeline.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&missing_pipeline.stderr).contains("not found"));
+    let missing_input = command("test");
+    assert_eq!(missing_input.status.code(), Some(64));
+    assert!(String::from_utf8_lossy(&missing_input.stderr).contains("required input `task`"));
+}
+
+#[test]
 fn binary_returns_three_for_a_failed_shell_command() {
     let fixture = Fixture::new();
     fixture.pipeline(

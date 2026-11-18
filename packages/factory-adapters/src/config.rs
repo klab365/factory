@@ -58,9 +58,17 @@ pub fn load_configuration(root: impl AsRef<Path>) -> Result<Configuration, Confi
     }
 
     let mut pipelines = Vec::with_capacity(pipeline_paths.len());
+    let mut pipeline_names = HashSet::new();
     for path in pipeline_paths {
         let dto: PipelineDto = parse_file(&path)?;
-        pipelines.push(validate_pipeline(dto, &path, &agents)?);
+        let pipeline = validate_pipeline(dto, &path, &agents)?;
+        if !pipeline_names.insert(pipeline.name.clone()) {
+            return Err(invalid(
+                &path,
+                format!("duplicate pipeline name `{}`", pipeline.name),
+            ));
+        }
+        pipelines.push(pipeline);
     }
 
     Ok(Configuration { agents, pipelines })
@@ -714,7 +722,60 @@ fn validate_pipeline(
     }
 
     for step in &steps {
+        let mut outcomes = HashSet::new();
         for transition in &step.transitions {
+            if transition.outcome.trim().is_empty() {
+                return Err(invalid(
+                    path,
+                    format!(
+                        "pipeline `{}` step `{}` has an empty transition outcome; provide a non-empty outcome",
+                        dto.name, step.id
+                    ),
+                ));
+            }
+            if !outcomes.insert(transition.outcome.clone()) {
+                return Err(invalid(
+                    path,
+                    format!(
+                        "pipeline `{}` step `{}` has duplicate transition outcome `{}`",
+                        dto.name, step.id, transition.outcome
+                    ),
+                ));
+            }
+            if matches!(&step.kind, StepKind::Shell { .. })
+                && !matches!(transition.outcome.as_str(), "success" | "failure")
+            {
+                return Err(invalid(
+                    path,
+                    format!(
+                        "pipeline `{}` shell step `{}` has unsupported transition outcome `{}`; shell steps can only produce `success` or `failure`",
+                        dto.name, step.id, transition.outcome
+                    ),
+                ));
+            }
+            if let StepKind::Human {
+                approval_keyword, ..
+            } = &step.kind
+            {
+                let supported = match approval_keyword {
+                    Some(_) => matches!(transition.outcome.as_str(), "approved" | "feedback"),
+                    None => transition.outcome == "success",
+                };
+                if !supported {
+                    let allowed = if approval_keyword.is_some() {
+                        "`approved` or `feedback`"
+                    } else {
+                        "`success` (no approval_keyword is configured)"
+                    };
+                    return Err(invalid(
+                        path,
+                        format!(
+                            "pipeline `{}` human step `{}` has unsupported transition outcome `{}`; human steps can only produce {allowed}",
+                            dto.name, step.id, transition.outcome
+                        ),
+                    ));
+                }
+            }
             if !step_ids.contains(&transition.target_step) {
                 return Err(invalid(
                     path,
@@ -725,6 +786,35 @@ fn validate_pipeline(
                 ));
             }
         }
+    }
+
+    let by_id: std::collections::HashMap<&str, &Step> =
+        steps.iter().map(|step| (step.id.as_str(), step)).collect();
+    let mut reachable = HashSet::new();
+    let mut pending = vec![steps[0].id.as_str()];
+    while let Some(id) = pending.pop() {
+        if !reachable.insert(id) {
+            continue;
+        }
+        if let Some(step) = by_id.get(id) {
+            pending.extend(
+                step.transitions
+                    .iter()
+                    .map(|transition| transition.target_step.as_str()),
+            );
+        }
+    }
+    if let Some(step) = steps
+        .iter()
+        .find(|step| !reachable.contains(step.id.as_str()))
+    {
+        return Err(invalid(
+            path,
+            format!(
+                "pipeline `{}` step `{}` is unreachable from first step `{}`; add a transition path or remove the step",
+                dto.name, step.id, steps[0].id
+            ),
+        ));
     }
 
     Ok(Pipeline {
@@ -1019,6 +1109,68 @@ mod tests {
             );
             let error = load_configuration(&project.0).unwrap_err();
             assert!(error.message.contains("whitespace-padded"), "{error}");
+        }
+    }
+
+    #[test]
+    fn allows_reachable_cycles_and_rejects_unreachable_steps() {
+        let project = TempProject::new();
+        project.file(".factory/agents/coder.toml", AGENT);
+        project.file(".factory/pipelines/feature.toml", "name = 'feature'\n[[inputs]]\nkey = 'task'\ndescription = 'Task'\n[[steps]]\nid = 'first'\ntype = 'agent'\nagent = 'coder'\n[[steps.transitions]]\noutcome = 'again'\ntarget_step = 'first'\n[[steps.transitions]]\noutcome = 'done'\ntarget_step = 'last'\n[[steps]]\nid = 'last'\ntype = 'shell'\ncommand = 'true'\n");
+        assert!(load_configuration(&project.0).is_ok());
+        project.file(".factory/pipelines/feature.toml", "name = 'feature'\n[[inputs]]\nkey = 'task'\ndescription = 'Task'\n[[steps]]\nid = 'first'\ntype = 'shell'\ncommand = 'true'\n[[steps]]\nid = 'orphan'\ntype = 'shell'\ncommand = 'true'\n");
+        let error = load_configuration(&project.0).unwrap_err();
+        assert!(error.message.contains("step `orphan` is unreachable"));
+        assert!(error.to_string().contains("feature.toml"));
+    }
+
+    #[test]
+    fn rejects_empty_and_duplicate_transition_outcomes() {
+        for outcome_lines in ["outcome = ''\n", "outcome = 'success'\n"] {
+            let project = TempProject::new();
+            project.file(".factory/agents/coder.toml", AGENT);
+            let duplicate = if outcome_lines.contains("success") {
+                "[[steps.transitions]]\noutcome = 'success'\ntarget_step = 'next'\n"
+            } else {
+                ""
+            };
+            project.file(".factory/pipelines/feature.toml", &format!("name = 'feature'\n[[inputs]]\nkey = 'task'\ndescription = 'Task'\n[[steps]]\nid = 'first'\ntype = 'agent'\nagent = 'coder'\n[[steps.transitions]]\n{outcome_lines}target_step = 'next'\n{duplicate}[[steps]]\nid = 'next'\ntype = 'shell'\ncommand = 'true'\n"));
+            let error = load_configuration(&project.0).unwrap_err();
+            assert!(error.message.contains("transition outcome"));
+        }
+    }
+
+    #[test]
+    fn validates_human_transition_outcomes_against_generated_outcomes() {
+        for (approval_keyword, outcomes) in [
+            ("", &[("typo", false), ("success", true)][..]),
+            (
+                "approval_keyword = 'approve'\n",
+                &[("success", false), ("approved", true), ("feedback", true)][..],
+            ),
+        ] {
+            for (outcome, is_accepted) in outcomes {
+                let project = TempProject::new();
+                project.file(
+                    ".factory/pipelines/feature.toml",
+                    &format!(
+                        "name = 'feature'\n[[inputs]]\nkey = 'task'\ndescription = 'Task'\n[[steps]]\nid = 'ask'\ntype = 'human'\nprompt = 'Approve?'\n{approval_keyword}[[steps.transitions]]\noutcome = '{outcome}'\ntarget_step = 'done'\n[[steps]]\nid = 'done'\ntype = 'shell'\ncommand = 'true'\n"
+                    ),
+                );
+                let result = load_configuration(&project.0);
+                if *is_accepted {
+                    assert!(result.is_ok(), "outcome `{outcome}`: {result:?}");
+                } else {
+                    let error = result.unwrap_err();
+                    assert!(
+                        error
+                            .message
+                            .contains(&format!("unsupported transition outcome `{outcome}`")),
+                        "unexpected error: {error}"
+                    );
+                    assert!(error.message.contains("human steps can only produce"));
+                }
+            }
         }
     }
 

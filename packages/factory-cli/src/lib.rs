@@ -31,6 +31,12 @@ const SHELL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Runs the CLI for arguments after the executable name and returns its process exit code.
 pub fn run_cli(args: &[String]) -> u8 {
+    if args.first().is_some_and(|arg| arg == "validate") {
+        return validate_configuration_command(args);
+    }
+    if args.first().is_some_and(|arg| arg == "plan") {
+        return plan_command(args);
+    }
     let pipeline_args = if args.first().is_some_and(|arg| arg == "run") {
         if matches!(args.get(1).map(String::as_str), Some("show" | "resume")) {
             return run_management_command(args);
@@ -72,6 +78,111 @@ pub fn run_cli(args: &[String]) -> u8 {
         }
     }
     run_new_pipeline(pipeline_name, &task_parts.join(" "), inputs)
+}
+
+fn validate_configuration_command(args: &[String]) -> u8 {
+    if args.len() != 1 {
+        eprintln!("Usage: factory validate");
+        return EXIT_USAGE_ERROR;
+    }
+    let root = match std::env::current_dir() {
+        Ok(root) => root,
+        Err(error) => {
+            eprintln!("Could not determine current directory: {error}");
+            return EXIT_CONFIGURATION_ERROR;
+        }
+    };
+    match load_configuration(root) {
+        Ok(configuration) => {
+            println!(
+                "Configuration valid ({} agents, {} pipelines)",
+                configuration.agents.len(),
+                configuration.pipelines.len()
+            );
+            EXIT_SUCCESS
+        }
+        Err(error) => {
+            eprintln!("Configuration error: {error}");
+            EXIT_CONFIGURATION_ERROR
+        }
+    }
+}
+
+fn plan_command(args: &[String]) -> u8 {
+    if args.len() < 2 {
+        eprintln!("Usage: factory plan <pipeline-name> [--input name=value]...");
+        return EXIT_USAGE_ERROR;
+    }
+    let mut inputs = HashMap::new();
+    let mut index = 2;
+    while index < args.len() {
+        if args[index] != "--input" || index + 1 >= args.len() {
+            eprintln!("Usage error: `--input` requires name=value");
+            return EXIT_USAGE_ERROR;
+        }
+        let Some((name, value)) = args[index + 1].split_once('=') else {
+            eprintln!("Usage error: input must use name=value");
+            return EXIT_USAGE_ERROR;
+        };
+        if name.is_empty() || inputs.insert(name.to_owned(), value.to_owned()).is_some() {
+            eprintln!("Usage error: input names must be non-empty and unique");
+            return EXIT_USAGE_ERROR;
+        }
+        index += 2;
+    }
+    let root = match std::env::current_dir() {
+        Ok(root) => root,
+        Err(error) => {
+            eprintln!("Could not determine current directory: {error}");
+            return EXIT_CONFIGURATION_ERROR;
+        }
+    };
+    let configuration = match load_configuration(root) {
+        Ok(configuration) => configuration,
+        Err(error) => {
+            eprintln!("Configuration error: {error}");
+            return EXIT_CONFIGURATION_ERROR;
+        }
+    };
+    let Some(pipeline) = configuration
+        .pipelines
+        .iter()
+        .find(|pipeline| pipeline.name == args[1])
+    else {
+        eprintln!("Configuration error: pipeline `{}` was not found", args[1]);
+        return EXIT_CONFIGURATION_ERROR;
+    };
+    if let Err(error) = validate_pipeline_inputs(pipeline, &inputs) {
+        eprintln!("Input error: {error}");
+        return EXIT_USAGE_ERROR;
+    }
+    println!(
+        "Plan for pipeline `{}` (configured control flow; outcomes are not simulated)",
+        pipeline.name
+    );
+    println!("Inputs:");
+    for input in &pipeline.inputs {
+        println!("  {} = {}", input.key, inputs[&input.key]);
+    }
+    println!("Steps:");
+    for step in &pipeline.steps {
+        let kind = match &step.kind {
+            StepKind::Agent { .. } => "agent",
+            StepKind::Shell { .. } => "shell",
+            StepKind::Human { .. } => "human",
+        };
+        println!("  {} ({kind})", step.id);
+        for transition in &step.transitions {
+            println!(
+                "    outcome `{}` -> `{}`",
+                transition.outcome, transition.target_step
+            );
+        }
+        if step.transitions.is_empty() {
+            println!("    (terminal)");
+        }
+    }
+    EXIT_SUCCESS
 }
 
 fn run_new_pipeline(pipeline_name: &str, task: &str, inputs: HashMap<String, String>) -> u8 {
