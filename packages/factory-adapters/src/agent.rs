@@ -11,6 +11,16 @@ pub trait AgentExecutor {
         step: &Step,
         previous_result: Option<&StepResult>,
     ) -> Result<StepOutput, String>;
+
+    fn execute_with_cancel(
+        &mut self,
+        agent: &AgentDefinition,
+        step: &Step,
+        previous_result: Option<&StepResult>,
+        _cancelled: &dyn Fn() -> bool,
+    ) -> Result<StepOutput, String> {
+        self.execute(agent, step, previous_result)
+    }
 }
 
 /// Bridges the application port to a harness executor without exposing
@@ -36,10 +46,23 @@ impl<E: AgentExecutor> AgentRunner for AgentRunnerAdapter<E> {
         step: &Step,
         previous_result: Option<&StepResult>,
     ) -> Result<StepOutput, String> {
+        self.run_with_cancel(agent, step, previous_result, &|| false)
+    }
+
+    fn run_with_cancel(
+        &mut self,
+        agent: &AgentDefinition,
+        step: &Step,
+        previous_result: Option<&StepResult>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<StepOutput, String> {
         match &step.kind {
             StepKind::Agent {
                 agent: step_agent, ..
-            } if step_agent == &agent.name => self.executor.execute(agent, step, previous_result),
+            } if step_agent == &agent.name => {
+                self.executor
+                    .execute_with_cancel(agent, step, previous_result, cancelled)
+            }
             StepKind::Agent {
                 agent: step_agent, ..
             } => Err(format!(

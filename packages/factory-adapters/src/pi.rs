@@ -58,6 +58,7 @@ impl PiAgentExecutor {
         agent: &AgentDefinition,
         step: &Step,
         previous_result: Option<&StepResult>,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<StepOutput, String> {
         if agent.harness != "pi" {
             return Err(format!(
@@ -102,6 +103,11 @@ impl PiAgentExecutor {
             allowed_outcomes(&agent.name).join(", ")
         );
         let mut command = Command::new(&self.executable);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
         command
             .args([
                 "--mode",
@@ -138,13 +144,23 @@ impl PiAgentExecutor {
         });
         let started = Instant::now();
         let status = loop {
+            if cancelled() {
+                kill_process_tree(&mut child)
+                    .map_err(|error| format!("could not stop cancelled Pi process: {error}"))?;
+                child
+                    .wait()
+                    .map_err(|error| format!("could not reap cancelled Pi process: {error}"))?;
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err("run was cancelled".into());
+            }
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) if started.elapsed() < self.timeout => {
                     thread::sleep(Duration::from_millis(100))
                 }
                 Ok(None) => {
-                    let _ = child.kill();
+                    let _ = kill_process_tree(&mut child);
                     let _ = child.wait();
                     let _ = stdout_reader.join();
                     let _ = stderr_reader.join();
@@ -155,11 +171,37 @@ impl PiAgentExecutor {
                     ));
                 }
                 Err(error) => {
-                    let _ = child.kill();
+                    let _ = kill_process_tree(&mut child);
+                    let _ = child.wait();
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
                     return Err(format!("could not wait for Pi: {error}"));
                 }
             }
         };
+        // Continue polling cancel and timeout while descendant processes may keep pipes open.
+        while !stdout_reader.is_finished() || !stderr_reader.is_finished() {
+            if cancelled() {
+                kill_process_tree(&mut child)
+                    .map_err(|error| format!("could not stop cancelled Pi process: {error}"))?;
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err("run was cancelled".into());
+            }
+            if started.elapsed() >= self.timeout {
+                let _ = kill_process_tree(&mut child);
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(format!(
+                    "Pi timed out after {} seconds for step `{}`",
+                    self.timeout.as_secs(),
+                    step.id
+                ));
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
         let stdout = stdout_reader
             .join()
             .map_err(|_| "Pi stdout reader panicked".to_owned())?
@@ -230,8 +272,12 @@ impl PiAgentExecutor {
         step: &Step,
         previous_result: Option<&StepResult>,
         retries: u32,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<StepOutput, String> {
-        match self.execute_once(agent, step, previous_result) {
+        if cancelled() {
+            return Err("run was cancelled".into());
+        }
+        match self.execute_once(agent, step, previous_result, cancelled) {
             Ok(mut output) => {
                 output.attempts = retries + 1;
                 Ok(output)
@@ -245,8 +291,15 @@ impl PiAgentExecutor {
                     retries + 1,
                     MAX_TRANSIENT_RETRIES
                 );
-                thread::sleep(INITIAL_RETRY_DELAY * (1 << retries));
-                self.execute_with_retries(agent, step, previous_result, retries + 1)
+                let delay = INITIAL_RETRY_DELAY * (1 << retries);
+                let until = Instant::now() + delay;
+                while Instant::now() < until {
+                    if cancelled() {
+                        return Err("run was cancelled".into());
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                self.execute_with_retries(agent, step, previous_result, retries + 1, cancelled)
             }
             Err(error) if retries > 0 => {
                 Err(format!("Pi failed after {} attempts: {error}", retries + 1))
@@ -263,7 +316,44 @@ impl AgentExecutor for PiAgentExecutor {
         step: &Step,
         previous_result: Option<&StepResult>,
     ) -> Result<StepOutput, String> {
-        self.execute_with_retries(agent, step, previous_result, 0)
+        self.execute_with_retries(agent, step, previous_result, 0, &|| false)
+    }
+
+    fn execute_with_cancel(
+        &mut self,
+        agent: &AgentDefinition,
+        step: &Step,
+        previous_result: Option<&StepResult>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<StepOutput, String> {
+        self.execute_with_retries(agent, step, previous_result, 0, cancelled)
+    }
+}
+
+fn kill_process_tree(child: &mut std::process::Child) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        kill_process_group(child.id())?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    child.kill()
+}
+
+#[cfg(unix)]
+fn kill_process_group(pid: u32) -> std::io::Result<()> {
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    if unsafe { kill(-(pid as i32), 9) } == 0 {
+        Ok(())
+    } else {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(3) {
+            Ok(())
+        } else {
+            Err(error)
+        }
     }
 }
 
@@ -1091,6 +1181,92 @@ mod tests {
         assert_eq!(output.outcome, "success");
         assert_eq!(output.attempts, 2);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleans_up_descendants_that_keep_pi_output_open_after_parent_exit() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("factory-pi-descendant-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let memory = root.join("memory.md");
+        fs::write(&memory, "memory").unwrap();
+        let executable = root.join("fake-pi.sh");
+        let transcript = json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"{\"outcome\":\"success\",\"output\":\"done\"}"}]}}).to_string();
+        fs::write(
+            &executable,
+            format!("#!/bin/sh\nsleep 30 &\nprintf '%s\\n' '{}'\n", transcript),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+        let mut executor =
+            PiAgentExecutor::with_command(HashMap::from([("coder".into(), memory)]), executable);
+        let agent = AgentDefinition {
+            name: "coder".into(),
+            harness: "pi".into(),
+            model: factory_core::ModelRef::parse("provider/model").unwrap(),
+            thinking_level: None,
+            prompt: "work".into(),
+        };
+        let step = Step {
+            id: "build".into(),
+            kind: StepKind::Agent {
+                agent: "coder".into(),
+                context: vec![],
+            },
+            transitions: vec![],
+        };
+        let started = Instant::now();
+        let result = executor.execute_with_cancel(&agent, &step, None, &|| {
+            started.elapsed() > Duration::from_millis(150)
+        });
+        assert!(result.unwrap_err().contains("cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminates_and_reaps_pi_process_when_cancelled() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("factory-pi-cancel-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let memory = root.join("memory.md");
+        fs::write(&memory, "memory").unwrap();
+        let executable = root.join("fake-pi.sh");
+        fs::write(&executable, "#!/bin/sh\nsleep 20\n").unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+        let mut executor =
+            PiAgentExecutor::with_command(HashMap::from([("coder".into(), memory)]), executable);
+        let agent = AgentDefinition {
+            name: "coder".into(),
+            harness: "pi".into(),
+            model: factory_core::ModelRef::parse("provider/model").unwrap(),
+            thinking_level: None,
+            prompt: "work".into(),
+        };
+        let step = Step {
+            id: "build".into(),
+            kind: StepKind::Agent {
+                agent: "coder".into(),
+                context: vec![],
+            },
+            transitions: vec![],
+        };
+        let started = Instant::now();
+        let result = executor.execute_with_cancel(&agent, &step, None, &|| {
+            started.elapsed() > Duration::from_millis(150)
+        });
+        assert!(result.unwrap_err().contains("cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

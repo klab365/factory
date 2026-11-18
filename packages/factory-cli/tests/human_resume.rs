@@ -104,6 +104,46 @@ sys.exit(child.returncode)
         command.output().expect("python3 PTY driver")
     }
 
+    fn cancel_pty(&self, args: &[&str], run_id: Option<&str>) -> Output {
+        let script = r#"
+import os, pty, select, subprocess, sys, time, errno
+factory = sys.argv[1]
+args = sys.argv[2:-1]
+master, slave = pty.openpty()
+child = subprocess.Popen([factory, *args], stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+os.close(slave)
+data = bytearray()
+start = time.monotonic()
+while b'Answer: ' not in data:
+    if child.poll() is not None: raise RuntimeError('CLI exited before prompting: ' + repr(bytes(data)))
+    ready, _, _ = select.select([master], [], [], 0.1)
+    if ready:
+        try: data.extend(os.read(master, 4096))
+        except OSError as error:
+            if error.errno == errno.EIO: break
+            raise
+    if time.monotonic() - start > 10: raise RuntimeError('timed out waiting for prompt')
+runs = os.path.join(os.getcwd(), '.factory', 'runs')
+run_id = sys.argv[-1] if sys.argv[-1] != '-' else None
+if run_id is None:
+    run_id = os.listdir(runs)[0]
+cancel = subprocess.run([factory, 'run', 'cancel', run_id], cwd=os.getcwd(), capture_output=True, text=True)
+if cancel.returncode != 0: raise RuntimeError('cancel failed: ' + cancel.stderr)
+try: code = child.wait(timeout=3)
+except subprocess.TimeoutExpired:
+    child.kill(); child.wait()
+    raise RuntimeError('interactive run did not exit after cancel')
+print('child_exit=' + str(code))
+"#;
+        let mut command = Command::new("python3");
+        command
+            .args(["-c", script, env!("CARGO_BIN_EXE_factory")])
+            .args(args)
+            .arg(run_id.unwrap_or("-"))
+            .current_dir(&self.root);
+        command.output().expect("python3 cancellation PTY driver")
+    }
+
     fn run_id(&self) -> String {
         fs::read_dir(self.root.join(".factory/runs"))
             .unwrap()
@@ -142,7 +182,7 @@ fn verify_resume(mode: &str, answer: &str, expected_option: &str, use_retry: boo
     assert!(record.contains("waiting_for_input"), "{record}");
     assert!(record.contains("Stored question?"), "{record}");
 
-    let shown = fixture.factory(&["run", "show", &run_id]);
+    let shown = fixture.factory(&["run", "show", &run_id, "--text"]);
     assert_eq!(shown.status.code(), Some(0), "{}", text(&shown));
     assert!(text(&shown).contains("Stored question?"));
 
@@ -184,7 +224,7 @@ fn verify_resume(mode: &str, answer: &str, expected_option: &str, use_retry: boo
     let record = fs::read_to_string(record_path).unwrap();
     assert!(record.contains("\"status\": \"succeeded\""), "{record}");
     assert!(record.contains("\"answer\": \""), "{record}");
-    let show = fixture.factory(&["run", "show", &run_id]);
+    let show = fixture.factory(&["run", "show", &run_id, "--text"]);
     assert!(text(&show).contains("succeeded"));
 }
 
@@ -196,6 +236,60 @@ fn freetext_pause_survives_restart_and_resumes_to_structured_shell_handoff() {
 #[test]
 fn choice_rejects_invalid_input_then_retry_resume_persists_structured_answer() {
     verify_resume("choice", "yes", "yes", true);
+}
+
+#[test]
+fn cancel_exits_running_human_prompt_without_input() {
+    let fixture = Fixture::new();
+    fixture.setup_pipeline("text");
+    let cancelled = fixture.cancel_pty(&["human-test", "--input", "task=test"], None);
+    assert_eq!(cancelled.status.code(), Some(0), "{}", text(&cancelled));
+    let run_id = fixture.run_id();
+    let record_path = fixture
+        .root
+        .join(".factory/runs")
+        .join(&run_id)
+        .join("run.json");
+    let record = fs::read_to_string(record_path).unwrap();
+    assert_eq!(
+        record.matches("\"status\": \"cancelled\"").count(),
+        2,
+        "{record}"
+    );
+    assert!(record.contains("\"pending_human\": null"), "{record}");
+    let show = fixture.factory(&["run", "show", &run_id, "--text"]);
+    assert!(
+        !text(&show).contains("Waiting for input at"),
+        "{}",
+        text(&show)
+    );
+}
+
+#[test]
+fn cancel_exits_waiting_resume_prompt_without_input() {
+    let fixture = Fixture::new();
+    fixture.setup_pipeline("text");
+    let initial = fixture.run_new();
+    assert_eq!(initial.status.code(), Some(0), "{}", text(&initial));
+    let run_id = fixture.run_id();
+    let cancelled = fixture.cancel_pty(&["run", "resume", &run_id], Some(&run_id));
+    assert_eq!(cancelled.status.code(), Some(0), "{}", text(&cancelled));
+    let record = fs::read_to_string(
+        fixture
+            .root
+            .join(".factory/runs")
+            .join(&run_id)
+            .join("run.json"),
+    )
+    .unwrap();
+    assert!(record.contains("\"status\": \"cancelled\""), "{record}");
+    assert!(record.contains("\"pending_human\": null"), "{record}");
+    let show = fixture.factory(&["run", "show", &run_id, "--text"]);
+    assert!(
+        !text(&show).contains("Waiting for input at"),
+        "{}",
+        text(&show)
+    );
 }
 
 #[test]

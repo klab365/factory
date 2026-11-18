@@ -33,6 +33,7 @@ impl Error for RunStoreError {}
 pub enum PersistedRunStatus {
     Running,
     Interrupted,
+    Cancelled,
     WaitingForInput,
     Succeeded,
     Failed,
@@ -45,6 +46,7 @@ pub enum StepAttemptStatus {
     Completed,
     Error,
     Interrupted,
+    Cancelled,
     WaitingForInput,
 }
 
@@ -203,6 +205,10 @@ pub struct RunRecord {
     pub started_at_ms: u128,
     pub updated_at_ms: u128,
     pub finished_at_ms: Option<u128>,
+    #[serde(default)]
+    pub cancelled_at_ms: Option<u128>,
+    #[serde(default)]
+    pub cancelled_step: Option<String>,
     pub steps: Vec<StepAttemptRecord>,
 }
 
@@ -236,6 +242,8 @@ impl RunStore {
                 started_at_ms: now,
                 updated_at_ms: now,
                 finished_at_ms: None,
+                cancelled_at_ms: None,
+                cancelled_step: None,
                 steps: Vec::new(),
             },
         };
@@ -387,6 +395,38 @@ impl RunStore {
         Ok(result)
     }
 
+    pub fn cancel(&mut self) -> Result<(), RunStoreError> {
+        let _lock = RunFileLock::acquire(&self.run_dir)?;
+        self.record = self.load_latest()?;
+        if matches!(
+            self.record.status,
+            PersistedRunStatus::Succeeded
+                | PersistedRunStatus::Failed
+                | PersistedRunStatus::Cancelled
+        ) {
+            return Err(store_error(
+                self.run_dir.join("run.json"),
+                "run is already terminal".into(),
+            ));
+        }
+        let now = now_ms()?;
+        self.record.status = PersistedRunStatus::Cancelled;
+        self.record.cancelled_at_ms = Some(now);
+        self.record.cancelled_step = self.record.current_step.clone();
+        if let Some(active) = self.record.steps.iter_mut().rev().find(|step| {
+            matches!(
+                step.status,
+                StepAttemptStatus::Running | StepAttemptStatus::WaitingForInput
+            )
+        }) {
+            active.status = StepAttemptStatus::Cancelled;
+            active.finished_at_ms = Some(now);
+        }
+        self.record.pending_human = None;
+        self.record.finished_at_ms = Some(now);
+        self.save_locked()
+    }
+
     pub fn mark_interrupted(&mut self) -> Result<(), RunStoreError> {
         self.record.status = PersistedRunStatus::Interrupted;
         for step in self.record.steps.iter_mut().rev() {
@@ -413,8 +453,55 @@ impl RunStore {
     }
 
     fn save(&mut self) -> Result<(), RunStoreError> {
-        self.record.updated_at_ms = now_ms()?;
+        let _lock = RunFileLock::acquire(&self.run_dir)?;
+        self.reload_latest()?;
+        self.save_locked()
+    }
+
+    fn load_latest(&self) -> Result<RunRecord, RunStoreError> {
         let path = self.run_dir.join("run.json");
+        let bytes = fs::read(&path).map_err(|error| store_error(&path, error.to_string()))?;
+        serde_json::from_slice(&bytes)
+            .map_err(|error| store_error(&path, format!("invalid run record: {error}")))
+    }
+
+    fn reload_latest(&mut self) -> Result<(), RunStoreError> {
+        let path = self.run_dir.join("run.json");
+        let Ok(bytes) = fs::read(&path) else {
+            return Ok(());
+        };
+        let latest: RunRecord = serde_json::from_slice(&bytes)
+            .map_err(|error| store_error(&path, format!("invalid run record: {error}")))?;
+        if latest.status == PersistedRunStatus::Cancelled
+            && self.record.status != PersistedRunStatus::Cancelled
+        {
+            self.record = latest;
+            return Err(store_error(&path, "run was cancelled".into()));
+        }
+        for newer in &latest.steps {
+            if let Some(local) = self
+                .record
+                .steps
+                .iter_mut()
+                .find(|step| step.step_id == newer.step_id && step.attempt == newer.attempt)
+            {
+                if local.status == StepAttemptStatus::Running && local.finished_at_ms.is_none() {
+                    *local = newer.clone();
+                }
+            } else {
+                self.record.steps.push(newer.clone());
+            }
+        }
+        self.record.steps.sort_by_key(|step| step.started_at_ms);
+        if self.record.current_step.is_none() {
+            self.record.current_step = latest.current_step;
+        }
+        Ok(())
+    }
+
+    fn save_locked(&mut self) -> Result<(), RunStoreError> {
+        let path = self.run_dir.join("run.json");
+        self.record.updated_at_ms = now_ms()?;
         let temporary = self
             .run_dir
             .join(format!(".run-{}.tmp", std::process::id()));
@@ -444,7 +531,18 @@ impl RunStore {
 }
 
 impl RunJournal for RunStore {
+    fn is_cancelled(&self) -> bool {
+        self.record.status == PersistedRunStatus::Cancelled
+            || fs::read(self.run_dir.join("run.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<RunRecord>(&bytes).ok())
+                .is_some_and(|record| record.status == PersistedRunStatus::Cancelled)
+    }
+
     fn step_started(&mut self, step_id: &str) -> Result<(), String> {
+        if self.is_cancelled() {
+            return Err("run was cancelled".into());
+        }
         let attempt = self
             .record
             .steps
@@ -453,6 +551,9 @@ impl RunJournal for RunStore {
             .count() as u32
             + 1;
         let started_at_ms = now_ms().map_err(|error| error.to_string())?;
+        if self.record.status == PersistedRunStatus::Cancelled {
+            return Err("run was cancelled".into());
+        }
         self.record.current_step = Some(step_id.into());
         self.record.status = PersistedRunStatus::Running;
         self.record.finished_at_ms = None;
@@ -503,6 +604,50 @@ impl RunJournal for RunStore {
     }
 }
 
+struct RunFileLock(File);
+
+impl RunFileLock {
+    fn acquire(run_dir: &Path) -> Result<Self, RunStoreError> {
+        let path = run_dir.join(".run.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|error| store_error(&path, error.to_string()))?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            unsafe extern "C" {
+                fn flock(fd: i32, operation: i32) -> i32;
+            }
+            // LOCK_EX; the kernel releases this lock when the process exits.
+            if unsafe { flock(file.as_raw_fd(), 2) } != 0 {
+                return Err(store_error(
+                    &path,
+                    std::io::Error::last_os_error().to_string(),
+                ));
+            }
+        }
+        Ok(Self(file))
+    }
+}
+
+impl Drop for RunFileLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            unsafe extern "C" {
+                fn flock(fd: i32, operation: i32) -> i32;
+            }
+            // LOCK_UN
+            let _ = unsafe { flock(self.0.as_raw_fd(), 8) };
+        }
+    }
+}
+
 fn now_ms() -> Result<u128, RunStoreError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -520,6 +665,119 @@ fn store_error(path: impl Into<PathBuf>, message: String) -> RunStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persists_cancellation_and_rejects_terminal_transition() {
+        let run_dir =
+            std::env::temp_dir().join(format!("factory-run-cancel-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&run_dir);
+        fs::create_dir_all(&run_dir).unwrap();
+        let mut store = RunStore::create(
+            &run_dir,
+            "cancel-test".into(),
+            "pipeline".into(),
+            "task".into(),
+            std::collections::HashMap::new(),
+        )
+        .unwrap();
+        store.step_started("build").unwrap();
+        store.cancel().unwrap();
+        assert_eq!(store.record().cancelled_step.as_deref(), Some("build"));
+        drop(store);
+        let mut reopened = RunStore::open(&run_dir).unwrap();
+        assert!(reopened.is_cancelled());
+        assert!(reopened.record().cancelled_at_ms.is_some());
+        assert!(reopened.cancel().is_err());
+        fs::remove_dir_all(run_dir).unwrap();
+    }
+
+    #[test]
+    fn cancel_closes_waiting_human_attempt_and_clears_pending_input() {
+        let run_dir =
+            std::env::temp_dir().join(format!("factory-run-cancel-human-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&run_dir);
+        fs::create_dir_all(&run_dir).unwrap();
+        let mut store = RunStore::create(
+            &run_dir,
+            "human-cancel".into(),
+            "pipeline".into(),
+            "task".into(),
+            Default::default(),
+        )
+        .unwrap();
+        store.step_started("ask").unwrap();
+        store.wait_for_human("ask", "Question?", &[]).unwrap();
+
+        store.cancel().unwrap();
+        let persisted = RunStore::open(&run_dir).unwrap();
+        assert_eq!(persisted.record().status, PersistedRunStatus::Cancelled);
+        assert!(persisted.record().pending_human.is_none());
+        assert_eq!(persisted.record().steps.len(), 1);
+        assert_eq!(
+            persisted.record().steps[0].status,
+            StepAttemptStatus::Cancelled
+        );
+        assert!(persisted.record().steps[0].finished_at_ms.is_some());
+        fs::remove_dir_all(run_dir).unwrap();
+    }
+
+    #[test]
+    fn stale_cancel_store_cannot_replace_successful_terminal_status() {
+        let run_dir =
+            std::env::temp_dir().join(format!("factory-run-cancel-stale-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&run_dir);
+        fs::create_dir_all(&run_dir).unwrap();
+        let mut run = RunStore::create(
+            &run_dir,
+            "run".into(),
+            "pipeline".into(),
+            "task".into(),
+            Default::default(),
+        )
+        .unwrap();
+        run.step_started("build").unwrap();
+        let mut stale_cancel = RunStore::open(&run_dir).unwrap();
+        run.step_completed(&StepResult {
+            step_id: "build".into(),
+            outcome: "success".into(),
+            output: String::new(),
+            exit_code: Some(0),
+            runner_attempts: 1,
+            handoff: None,
+        })
+        .unwrap();
+        run.finish(PersistedRunStatus::Succeeded).unwrap();
+        assert!(stale_cancel.cancel().is_err());
+        assert_eq!(
+            RunStore::open(&run_dir).unwrap().record().status,
+            PersistedRunStatus::Succeeded
+        );
+        fs::remove_dir_all(run_dir).unwrap();
+    }
+
+    #[test]
+    fn cancel_uses_latest_step_after_step_change() {
+        let run_dir =
+            std::env::temp_dir().join(format!("factory-run-cancel-step-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&run_dir);
+        fs::create_dir_all(&run_dir).unwrap();
+        let mut run = RunStore::create(
+            &run_dir,
+            "run".into(),
+            "pipeline".into(),
+            "task".into(),
+            Default::default(),
+        )
+        .unwrap();
+        run.step_started("first").unwrap();
+        let mut stale_cancel = RunStore::open(&run_dir).unwrap();
+        run.step_failed("first", "retry").unwrap();
+        run.step_started("second").unwrap();
+        stale_cancel.cancel().unwrap();
+        let record = RunStore::open(&run_dir).unwrap();
+        assert_eq!(record.record().cancelled_step.as_deref(), Some("second"));
+        fs::remove_dir_all(run_dir).unwrap();
+    }
 
     #[test]
     fn persists_step_execution_errors_for_run_inspection() {
@@ -552,6 +810,41 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("HTTP 503")
+        );
+        fs::remove_dir_all(run_dir).unwrap();
+    }
+
+    #[test]
+    fn stale_journal_cannot_overwrite_cancel_or_drop_persisted_attempts() {
+        let run_dir = std::env::temp_dir().join(format!("factory-run-race-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&run_dir);
+        fs::create_dir_all(&run_dir).unwrap();
+        let mut journal = RunStore::create(
+            &run_dir,
+            "race-test".into(),
+            "pipeline".into(),
+            "task".into(),
+            std::collections::HashMap::new(),
+        )
+        .unwrap();
+        journal.step_started("build").unwrap();
+        let mut cancel = RunStore::open(&run_dir).unwrap();
+        cancel.cancel().unwrap();
+        let result = StepResult {
+            step_id: "build".into(),
+            outcome: "success".into(),
+            output: "done".into(),
+            exit_code: Some(0),
+            runner_attempts: 1,
+            handoff: None,
+        };
+        assert!(journal.step_completed(&result).is_err());
+        let persisted = RunStore::open(&run_dir).unwrap();
+        assert_eq!(persisted.record().status, PersistedRunStatus::Cancelled);
+        assert_eq!(persisted.record().steps.len(), 1);
+        assert_eq!(
+            persisted.record().steps[0].status,
+            StepAttemptStatus::Cancelled
         );
         fs::remove_dir_all(run_dir).unwrap();
     }

@@ -199,6 +199,53 @@ fn binary_returns_four_for_terminal_agent_failure() {
 }
 
 #[test]
+fn run_show_returns_complete_json_with_results_and_retry_history() {
+    let fixture = Fixture::new();
+    fixture.pipeline("name = 'test'\n[[inputs]]\nkey = 'task'\ndescription = 'Task'\n[[steps]]\nid = 'shell'\ntype = 'shell'\ncommand = '/bin/sh'\nargs = ['-c', 'if [ -e marker ]; then echo retried; else touch marker; echo first-attempt; exit 1; fi']\n");
+    let initial = fixture.run("test");
+    assert_eq!(initial.status.code(), Some(3));
+    let run_id = String::from_utf8_lossy(&initial.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("Run ID: "))
+        .unwrap()
+        .to_owned();
+    let record_path = fixture
+        .root
+        .join(".factory/runs")
+        .join(&run_id)
+        .join("run.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    record["status"] = serde_json::json!("interrupted");
+    record["steps"][0]["status"] = serde_json::json!("interrupted");
+    fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    let retry = Command::new(env!("CARGO_BIN_EXE_factory"))
+        .args(["run", "resume", &run_id, "--retry-current"])
+        .current_dir(&fixture.root)
+        .output()
+        .unwrap();
+    assert_eq!(
+        retry.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    let shown = Command::new(env!("CARGO_BIN_EXE_factory"))
+        .args(["run", "show", &run_id])
+        .current_dir(&fixture.root)
+        .output()
+        .unwrap();
+    assert_eq!(shown.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(json["steps"].as_array().unwrap().len(), 2);
+    assert_eq!(json["steps"][0]["result"]["output"], "first-attempt\n");
+    assert_eq!(json["steps"][0]["result"]["exit_code"], 1);
+    assert_eq!(json["steps"][1]["attempt"], 2);
+    assert_eq!(json["steps"][1]["result"]["output"], "retried\n");
+    assert_eq!(json["steps"][1]["result"]["runner_attempts"], 1);
+}
+
+#[test]
 fn binary_returns_two_for_configuration_errors() {
     let fixture = Fixture::new();
     assert_eq!(exit_code(fixture.run("missing")), 2);

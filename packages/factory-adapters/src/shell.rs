@@ -51,12 +51,18 @@ impl ShellRunnerAdapter {
         command: &str,
         args: &[String],
         previous_result: Option<&factory_core::features::StepResult>,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<StepOutput, String> {
         let resolved_args = args
             .iter()
             .map(|arg| substitute_inputs(arg, &self.config.inputs, &step.id))
             .collect::<Result<Vec<_>, _>>()?;
         let mut command = Command::new(command);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
         command
             .args(&resolved_args)
             .current_dir(&self.config.working_directory)
@@ -110,14 +116,25 @@ impl ShellRunnerAdapter {
         let stderr_reader = thread::spawn(move || read_all(stderr));
         let started = Instant::now();
 
-        let status = loop {
+        let mut status = loop {
+            if cancelled() {
+                kill_process_tree(&mut child).map_err(|error| {
+                    format!("could not stop cancelled shell step `{}`: {error}", step.id)
+                })?;
+                child.wait().map_err(|error| {
+                    format!("could not reap cancelled shell step `{}`: {error}", step.id)
+                })?;
+                let _ = join_reader(stdout_reader, &step.id)?;
+                let _ = join_reader(stderr_reader, &step.id)?;
+                return Err("run was cancelled".into());
+            }
             match child
                 .try_wait()
                 .map_err(|error| format!("could not wait for shell step `{}`: {error}", step.id))?
             {
                 Some(status) => break Some(status),
                 None if started.elapsed() >= self.config.timeout => {
-                    child.kill().map_err(|error| {
+                    kill_process_tree(&mut child).map_err(|error| {
                         format!("could not stop timed-out shell step `{}`: {error}", step.id)
                     })?;
                     child.wait().map_err(|error| {
@@ -129,6 +146,27 @@ impl ShellRunnerAdapter {
             }
         };
 
+        // Keep observing cancellation while descendants may still hold inherited pipes.
+        while !stdout_reader.is_finished() || !stderr_reader.is_finished() {
+            if cancelled() {
+                kill_process_tree(&mut child).map_err(|error| {
+                    format!("could not stop cancelled shell step `{}`: {error}", step.id)
+                })?;
+                let _ = child.wait();
+                let _ = join_reader(stdout_reader, &step.id)?;
+                let _ = join_reader(stderr_reader, &step.id)?;
+                return Err("run was cancelled".into());
+            }
+            if started.elapsed() >= self.config.timeout {
+                kill_process_tree(&mut child).map_err(|error| {
+                    format!("could not stop timed-out shell step `{}`: {error}", step.id)
+                })?;
+                let _ = child.wait();
+                status = None;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
         let stdout = join_reader(stdout_reader, &step.id)?;
         let stderr = join_reader(stderr_reader, &step.id)?;
         let output =
@@ -155,12 +193,51 @@ impl ShellRunner for ShellRunnerAdapter {
         step: &Step,
         previous_result: Option<&factory_core::features::StepResult>,
     ) -> Result<StepOutput, String> {
+        self.run_with_cancel(step, previous_result, &|| false)
+    }
+
+    fn run_with_cancel(
+        &mut self,
+        step: &Step,
+        previous_result: Option<&factory_core::features::StepResult>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<StepOutput, String> {
         match &step.kind {
-            StepKind::Shell { command, args } => self.execute(step, command, args, previous_result),
+            StepKind::Shell { command, args } => {
+                self.execute(step, command, args, previous_result, cancelled)
+            }
             StepKind::Agent { .. } | StepKind::Human { .. } => Err(format!(
                 "shell runner cannot execute non-shell step `{}`",
                 step.id
             )),
+        }
+    }
+}
+
+fn kill_process_tree(child: &mut std::process::Child) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        kill_process_group(child.id())?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    child.kill()
+}
+
+#[cfg(unix)]
+fn kill_process_group(pid: u32) -> std::io::Result<()> {
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    // ESRCH means the group has already exited, which is a successful cleanup.
+    if unsafe { kill(-(pid as i32), 9) } == 0 {
+        Ok(())
+    } else {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(3) {
+            Ok(())
+        } else {
+            Err(error)
         }
     }
 }
@@ -409,6 +486,38 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(unix)]
+    #[test]
+    fn cleans_up_descendants_that_keep_output_open_after_parent_exit() {
+        let root =
+            std::env::temp_dir().join(format!("factory-shell-descendant-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut runner =
+            ShellRunnerAdapter::new(ShellRunnerConfig::new(&root, Duration::from_secs(3)));
+        let step = shell_step("/bin/sh", &["-c", "sleep 30 & exit 0"]);
+        let started = Instant::now();
+        let result = runner.run_with_cancel(&step, None, &|| {
+            started.elapsed() > Duration::from_millis(150)
+        });
+        assert!(result.unwrap_err().contains("cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminates_and_reaps_a_running_process_when_cancelled() {
+        let dir = std::env::temp_dir();
+        let mut config = ShellRunnerConfig::new(dir, Duration::from_secs(5));
+        config.environment = std::env::vars_os().collect();
+        let mut runner = ShellRunnerAdapter::new(config);
+        let started = Instant::now();
+        let result = runner.run_with_cancel(&shell_step("sh", &["-c", "sleep 20"]), None, &|| {
+            started.elapsed() > Duration::from_millis(100)
+        });
+        assert!(result.unwrap_err().contains("cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
     #[test]
     fn terminates_processes_that_exceed_the_timeout() {
         let config = ShellRunnerConfig::new(".", Duration::from_millis(30));

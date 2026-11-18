@@ -12,6 +12,7 @@ use super::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunError {
     EmptyPipeline,
+    Cancelled,
     MissingAgent { step_id: String, agent: String },
     RunnerFailed { step_id: String, message: String },
     UnknownOutcome { step_id: String, outcome: String },
@@ -28,6 +29,7 @@ impl fmt::Display for RunError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyPipeline => write!(f, "cannot run an empty pipeline"),
+            Self::Cancelled => write!(f, "run was cancelled"),
             Self::MissingAgent { step_id, agent } => {
                 write!(f, "step `{step_id}` references missing agent `{agent}`")
             }
@@ -168,6 +170,9 @@ pub fn run_pipeline_with_journal<A: AgentRunner, S: ShellRunner, J: RunJournal>(
     }
 
     loop {
+        if journal.is_cancelled() {
+            return Err(RunError::Cancelled);
+        }
         if results.len() >= max_step_executions {
             return Err(RunError::StepLimitExceeded {
                 limit: max_step_executions,
@@ -186,6 +191,7 @@ pub fn run_pipeline_with_journal<A: AgentRunner, S: ShellRunner, J: RunJournal>(
             .step_started(&step.id)
             .map_err(|message| RunError::JournalFailed { message })?;
 
+        let cancelled = || journal.is_cancelled();
         let execution = match &step.kind {
             StepKind::Agent { agent, .. } => {
                 let definition = agent_index.get(agent.as_str()).copied().ok_or_else(|| {
@@ -194,9 +200,11 @@ pub fn run_pipeline_with_journal<A: AgentRunner, S: ShellRunner, J: RunJournal>(
                         agent: agent.clone(),
                     }
                 })?;
-                agent_runner.run(definition, step, results.last())
+                agent_runner.run_with_cancel(definition, step, results.last(), &cancelled)
             }
-            StepKind::Shell { .. } => shell_runner.run(step, results.last()),
+            StepKind::Shell { .. } => {
+                shell_runner.run_with_cancel(step, results.last(), &cancelled)
+            }
             StepKind::Human {
                 prompt,
                 options,
@@ -251,6 +259,9 @@ pub fn run_pipeline_with_journal<A: AgentRunner, S: ShellRunner, J: RunJournal>(
                 })
             }
         };
+        if journal.is_cancelled() {
+            return Err(RunError::Cancelled);
+        }
         let output = match execution {
             Ok(output) => output,
             Err(message) => {

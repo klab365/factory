@@ -42,11 +42,24 @@ steps:
       human_feedback:
         from: steps.approval.handoff.answer
         optional: true
+      validation_feedback:
+        from: steps.validate.output
+        optional: true
+    transitions:
+      - outcome: success
+        target_step: validate
+      - outcome: failure
+        target_step: review
+
+  - id: validate
+    type: shell
+    command: sh
+    args: [-c, "mise run fmt && mise run lint && mise run test && mise run build"]
     transitions:
       - outcome: success
         target_step: review
       - outcome: failure
-        target_step: review
+        target_step: build
 
   - id: review
     type: agent
@@ -65,21 +78,14 @@ steps:
       - outcome: changes_requested
         target_step: build
       - outcome: approved
-        target_step: test
-
-  - id: test
-    type: shell
-    command: mise
-    args: [test]
-    transitions:
-      - outcome: success
         target_step: approval
 
   - id: approval
     type: human
     prompt: |
-      Tests sind erfolgreich. Gib konkretes Feedback ein, wenn noch etwas geändert
-      werden soll. Der Coder setzt es um und danach laufen Review und Tests erneut.
+      Formatierung, Clippy, Tests und Build sind erfolgreich. Gib konkretes Feedback
+      ein, wenn noch etwas geändert werden soll. Der Coder setzt es um und danach
+      laufen Validierung und Review erneut.
       Antworte exakt mit `approved`, wenn alles passt und ich committen, pushen und
       einen Pull Request erstellen darf.
     approval_keyword: approved
@@ -98,6 +104,6 @@ steps:
       issue_url:
         from: inputs.issue_url
       test_result:
-        from: steps.test.output
+        from: steps.validate.output
       review_result:
         from: steps.review.output

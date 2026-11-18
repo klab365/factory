@@ -38,7 +38,10 @@ pub fn run_cli(args: &[String]) -> u8 {
         return plan_command(args);
     }
     let pipeline_args = if args.first().is_some_and(|arg| arg == "run") {
-        if matches!(args.get(1).map(String::as_str), Some("show" | "resume")) {
+        if matches!(
+            args.get(1).map(String::as_str),
+            Some("show" | "resume" | "cancel")
+        ) {
             return run_management_command(args);
         }
         if args.len() < 2 {
@@ -321,7 +324,8 @@ fn run_management_command(args: &[String]) -> u8 {
         eprintln!("Run error: {error}");
         return EXIT_USAGE_ERROR;
     }
-    if !((action == "show" && args.len() == 3)
+    if !((action == "show" && (args.len() == 3 || (args.len() == 4 && args[3] == "--text")))
+        || (action == "cancel" && args.len() == 3)
         || (action == "resume"
             && (args.len() == 3 || (args.len() == 4 && args[3] == "--retry-current"))))
     {
@@ -344,14 +348,70 @@ fn run_management_command(args: &[String]) -> u8 {
         }
     };
     match action {
-        "show" if args.len() == 3 => match store.display_json() {
-            Ok(json) => {
-                println!("{json}");
+        "show" if args.len() == 3 || (args.len() == 4 && args[3] == "--text") => {
+            let record = store.record();
+            if args.len() == 3 {
+                match serde_json::to_string_pretty(record) {
+                    Ok(json) => println!("{json}"),
+                    Err(error) => {
+                        eprintln!("Could not serialize run `{run_id}`: {error}");
+                        return EXIT_CONFIGURATION_ERROR;
+                    }
+                }
+                return EXIT_SUCCESS;
+            }
+            let end = record.finished_at_ms.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(record.updated_at_ms, |duration| duration.as_millis())
+            });
+            let completed_steps = record
+                .steps
+                .iter()
+                .filter(|step| {
+                    step.status == factory_adapters::run_store::StepAttemptStatus::Completed
+                })
+                .map(|step| step.step_id.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            println!(
+                "Run: {}\nPipeline: {}\nStatus: {}\nCurrent/last step: {}\nCompleted distinct steps: {}\nStep attempts: {}\nDuration: {} ms",
+                record.run_id,
+                record.pipeline_name,
+                format!("{:?}", record.status).to_lowercase(),
+                record.current_step.as_deref().unwrap_or("(none)"),
+                completed_steps,
+                record.steps.len(),
+                end.saturating_sub(record.started_at_ms)
+            );
+            if let Some(pending) = &record.pending_human {
+                println!(
+                    "Waiting for input at {}: {}",
+                    pending.step_id, pending.prompt
+                );
+            }
+            for attempt in &record.steps {
+                println!(
+                    "Step {} attempt {}: {:?}{}",
+                    attempt.step_id,
+                    attempt.attempt,
+                    attempt.status,
+                    attempt
+                        .error
+                        .as_ref()
+                        .map_or(String::new(), |error| format!(" — {error}"))
+                );
+            }
+            EXIT_SUCCESS
+        }
+        "cancel" if args.len() == 3 => match store.cancel() {
+            Ok(()) => {
+                println!("Run `{run_id}` cancelled");
                 EXIT_SUCCESS
             }
             Err(error) => {
-                eprintln!("Could not display run `{run_id}`: {error}");
-                EXIT_EXECUTION_ERROR
+                eprintln!("Could not cancel run `{run_id}`: {error}");
+                EXIT_USAGE_ERROR
             }
         },
         "resume" if args.len() == 3 || (args.len() == 4 && args[3] == "--retry-current") => {
@@ -370,6 +430,13 @@ fn resume_run(
     store: &mut RunStore,
     retry_current: bool,
 ) -> u8 {
+    if store.record().status == PersistedRunStatus::Cancelled {
+        eprintln!(
+            "Run `{}` is cancelled and cannot be resumed",
+            store.record().run_id
+        );
+        return EXIT_USAGE_ERROR;
+    }
     if store.record().status == PersistedRunStatus::Succeeded
         || (store.record().status == PersistedRunStatus::Failed
             && !store.has_unresolved_attempt()
@@ -501,6 +568,10 @@ fn finish_pipeline_result(
             print_report(&report, pipeline)
         }
         Err(error) => {
+            if store.is_cancelled() {
+                eprintln!("Run `{}` was cancelled", store.record().run_id);
+                return EXIT_SUCCESS;
+            }
             if store.record().status == PersistedRunStatus::WaitingForInput {
                 eprintln!("{}", error);
                 return EXIT_SUCCESS;
@@ -529,11 +600,35 @@ fn read_resume_answer(store: &RunStore) -> Result<String, String> {
     }
     eprint!("Answer: ");
     io::stderr().flush().map_err(|e| e.to_string())?;
-    let mut answer = String::new();
-    io::stdin()
-        .read_line(&mut answer)
-        .map_err(|e| e.to_string())?;
+    let answer = read_interactive_line_or_cancel(store)?;
     Ok(answer.trim().to_owned())
+}
+
+fn read_interactive_line_or_cancel(store: &RunStore) -> Result<String, String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let result = io::stdin()
+            .read_line(&mut line)
+            .map(|bytes| if bytes == 0 { None } else { Some(line) })
+            .map_err(|error| error.to_string());
+        let _ = sender.send(result);
+    });
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(Ok(Some(line))) => return Ok(line),
+            Ok(Ok(None)) => return Err("stdin is closed".into()),
+            Ok(Err(error)) => return Err(format!("could not read human answer: {error}")),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if store.is_cancelled() {
+                    return Err("run was cancelled".into());
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("stdin reader stopped unexpectedly".into());
+            }
+        }
+    }
 }
 
 fn fail_run(store: &mut RunStore, exit_code: u8) -> u8 {
@@ -703,6 +798,10 @@ impl<'a> ConsoleRunJournal<'a> {
 }
 
 impl RunJournal for ConsoleRunJournal<'_> {
+    fn is_cancelled(&self) -> bool {
+        self.store.is_cancelled()
+    }
+
     fn step_started(&mut self, step_id: &str) -> Result<(), String> {
         self.store.step_started(step_id)?;
         let record = self.store.record();
@@ -740,12 +839,8 @@ impl RunJournal for ConsoleRunJournal<'_> {
         loop {
             eprint!("Answer: ");
             io::stderr().flush().map_err(|error| error.to_string())?;
-            let mut answer = String::new();
-            let bytes = match io::stdin().read_line(&mut answer) {
-                Ok(bytes) => bytes,
-                Err(error) => return Err(format!("could not read human answer: {error}")),
-            };
-            if bytes == 0 {
+            let answer = read_interactive_line_or_cancel(self.store)?;
+            if answer.is_empty() {
                 return Err("stdin is closed; human question remains pending".into());
             }
             let answer = answer.trim().to_owned();

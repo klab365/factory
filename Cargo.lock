@@ -25,6 +25,7 @@ version = "0.1.0"
 dependencies = [
  "factory-adapters",
  "factory-core",
+ "serde_json",
 ]
 
 [[package]]
