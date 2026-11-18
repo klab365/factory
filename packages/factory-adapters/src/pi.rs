@@ -334,7 +334,7 @@ fn kill_process_tree(child: &mut std::process::Child) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         kill_process_group(child.id())?;
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(unix))]
     child.kill()

@@ -611,6 +611,7 @@ impl RunFileLock {
         let path = run_dir.join(".run.lock");
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path)
