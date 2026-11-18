@@ -631,16 +631,16 @@ fn validate_pipeline(
                         ),
                     ));
                 }
-                if let Some(keyword) = &approval_keyword {
-                    if keyword.trim().is_empty() || !options.is_empty() {
-                        return Err(invalid(
-                            path,
-                            format!(
-                                "pipeline `{}` step `{id}` approval_keyword must be non-empty and cannot be combined with options",
-                                dto.name
-                            ),
-                        ));
-                    }
+                if let Some(keyword) = &approval_keyword
+                    && (keyword.trim().is_empty() || !options.is_empty())
+                {
+                    return Err(invalid(
+                        path,
+                        format!(
+                            "pipeline `{}` step `{id}` approval_keyword must be non-empty and cannot be combined with options",
+                            dto.name
+                        ),
+                    ));
                 }
                 let mut option_ids = HashSet::new();
                 let options = options.into_iter().map(|option| {
