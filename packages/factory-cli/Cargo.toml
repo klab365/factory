@@ -10,3 +10,4 @@ path = "src/main.rs"
 [dependencies]
 factory-adapters = { path = "../factory-adapters" }
 factory-core = { path = "../factory-core" }
+serde_json = "1"

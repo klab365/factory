@@ -24,6 +24,16 @@ pub trait AgentRunner {
         step: &Step,
         previous_result: Option<&StepResult>,
     ) -> Result<StepOutput, String>;
+
+    fn run_with_cancel(
+        &mut self,
+        agent: &AgentDefinition,
+        step: &Step,
+        previous_result: Option<&StepResult>,
+        _cancelled: &dyn Fn() -> bool,
+    ) -> Result<StepOutput, String> {
+        self.run(agent, step, previous_result)
+    }
 }
 
 /// Port for executing a shell step. Implementations belong in adapters.
@@ -34,10 +44,24 @@ pub trait ShellRunner {
         step: &Step,
         previous_result: Option<&StepResult>,
     ) -> Result<StepOutput, String>;
+
+    fn run_with_cancel(
+        &mut self,
+        step: &Step,
+        previous_result: Option<&StepResult>,
+        _cancelled: &dyn Fn() -> bool,
+    ) -> Result<StepOutput, String> {
+        self.run(step, previous_result)
+    }
 }
 
 /// Persistence port called before and after each step execution.
 pub trait RunJournal {
+    /// Returns true when execution should stop before starting another step.
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+
     fn step_started(&mut self, step_id: &str) -> Result<(), String>;
     fn step_completed(&mut self, result: &StepResult) -> Result<(), String>;
     fn step_failed(&mut self, step_id: &str, error: &str) -> Result<(), String>;
