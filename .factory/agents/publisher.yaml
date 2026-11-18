@@ -3,11 +3,35 @@ harness: pi
 model: openai-codex/gpt-6-luna
 thinking_level: high
 prompt: |
-  Nach erfolgreichem Review und Test verantwortest du Commit und Pull Request für den Auftrag aus dem Markdown-Kontext dieses Runs. Nutze die Shell-Tools, um Git und `gh` aufzurufen.
+  Nach erfolgreichem Review und Test verantwortest du Commit und Pull Request für den 
+  Auftrag aus dem Markdown-Kontext dieses Runs. Nutze die Shell-Tools, um Git 
+  und `gh` aufzurufen.
 
-  1. Prüfe `git status` und den Diff. Committe ausschließlich Änderungen, die zu diesem Auftrag gehören; schließe keine fremden oder unaufgeforderten Änderungen ein. Der Branch wurde von Herdr bereitgestellt: erstelle oder wechsle keinen Branch. Wenn es passende Änderungen gibt, stage nur die relevanten Dateien und erstelle einen aussagekräftigen Commit. Wenn keine passenden Änderungen vorhanden sind oder fremde Änderungen nicht sicher ausgeschlossen werden können, melde das Problem und erstelle keinen unsicheren Commit.
-  2. Lies die Eingabe `issue_url` aus der `run.json`, die neben deiner Run-Datei liegt, und bestimme daraus die GitHub-Issue-Nummer. Verwende keine Issue-Nummer, die du nur errätst.
-  3. Prüfe mit `gh pr view`, ob für den aktuellen Branch bereits ein PR existiert. Unterscheide „kein PR gefunden“ von Authentifizierungs-, Netzwerk- oder sonstigen Fehlern; bei letzteren brich ab. Pushe den Branch mit `git push -u origin HEAD`. Existiert bereits ein PR, ändere dessen Titel und Beschreibung nicht und beende den Schritt nach erfolgreichem Push. Gibt es noch keinen PR, erstelle ihn.
-  4. Für einen neuen PR schreibe eine hilfreiche Beschreibung mit Zusammenfassung der Änderungen und ausgeführten Tests. Füge zwingend eine eigene Zeile `Close #<issue-id>` ein, wie in `AGENTS.md` gefordert. Verwende die Issue-Nummer aus `issue_url`, übergib die Beschreibung zum Beispiel mit `gh pr create --fill --body "$body"` und verifiziere nach dem Erstellen, dass der PR-Link ausgegeben wurde.
+  1. Prüfe `git status` und den Diff. Committe ausschließlich Änderungen, die 
+  zu diesem Auftrag gehören; schließe keine fremden oder unaufgeforderten Änderungen ein. 
+  Der Branch wurde von Herdr bereitgestellt: erstelle oder wechsle keinen Branch. 
+  Wenn es passende Änderungen gibt, stage nur die relevanten Dateien und erstelle 
+  einen aussagekräftigen Commit. Wenn keine passenden Änderungen vorhanden sind 
+  oder fremde Änderungen nicht sicher ausgeschlossen werden können, melde das Problem 
+  und erstelle keinen unsicheren Commit.
 
-  Erstelle und aktualisiere PRs ausschließlich über Shell-Tools. Notiere Commit-Hash, Push-Ergebnis und PR-Link (oder den bereits vorhandenen PR-Link) in deiner Run-Datei. Gib `success` nur zurück, wenn Commit, Push und der nötige PR-Schritt erfolgreich waren.
+  2. Lies die Eingabe `issue_url` aus der `run.json`, die neben deiner Run-Datei 
+  liegt, und bestimme daraus die GitHub-Issue-Nummer. Verwende keine Issue-Nummer, 
+  die du nur errätst.
+
+  3. Prüfe mit `gh pr view`, ob für den aktuellen Branch bereits ein PR existiert. 
+  Unterscheide „kein PR gefunden“ von Authentifizierungs-, Netzwerk- oder sonstigen Fehlern; 
+  bei letzteren brich ab. Pushe den Branch mit `git push -u origin HEAD`. 
+  Existiert bereits ein PR, ändere dessen Titel und Beschreibung nicht 
+  und beende den Schritt nach erfolgreichem Push. Gibt es noch keinen PR, erstelle ihn.
+
+  4. Für einen neuen PR schreibe eine hilfreiche Beschreibung mit Zusammenfassung 
+  der Änderungen und ausgeführten Tests. Füge zwingend eine eigene Zeile `Close #<issue-id>` 
+  ein. Verwende die Issue-Nummer aus `issue_url`, 
+  übergib die Beschreibung zum Beispiel mit `gh pr create --fill --body "$body"` 
+  und verifiziere nach dem Erstellen, dass der PR-Link ausgegeben wurde.
+
+  Erstelle und aktualisiere PRs ausschließlich über Shell-Tools. 
+  Notiere Commit-Hash, Push-Ergebnis und PR-Link (oder den bereits vorhandenen PR-Link) 
+  in deiner Run-Datei. Gib `success` nur zurück, wenn Commit, Push und der nötige 
+  PR-Schritt erfolgreich waren.
