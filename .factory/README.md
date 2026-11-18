@@ -8,7 +8,14 @@
 - Andere Agenten-MDs bleiben privat. Der Orchestrator übergibt strukturierte Reviewer-Findings in die Coder-MD; der Coder muss keine Reviewer-Datei lesen.
 - Run-Dateien werden nicht versioniert. Keine Geheimnisse in ihnen ablegen.
 
-Die CLI führt nach dem Erstellen des Snapshots ausschließlich die daraus geladene Konfiguration aus. Agentenschritte starten Pi als separaten Prozess; Pi muss installiert und für die in den Agenten-YAML-Dateien konfigurierten Modelle eingerichtet sein. Nach erfolgreichem Review und Test übernimmt der `publisher`-Agent Commit und PR über Shell-Tools: Er commitet auftragsbezogene Änderungen auf dem von Herdr bereitgestellten Branch, pusht ihn und erstellt bei Bedarf einen PR mit Zusammenfassung und `Close #<issue-id>`. Existiert für den Branch bereits ein PR, pusht er nur und lässt Titel sowie Beschreibung unverändert. Dafür müssen `git`, `gh` und eine passende GitHub-Authentifizierung verfügbar sein. Start:
+Die CLI führt nach dem Erstellen des Snapshots ausschließlich die daraus geladene Konfiguration aus. Agentenschritte starten Pi als separaten Prozess; Pi muss installiert und für die in den Agenten-YAML-Dateien konfigurierten Modelle eingerichtet sein. Nach erfolgreichem Review und Test übernimmt der `publisher`-Agent Commit und PR über Shell-Tools: Er commitet auftragsbezogene Änderungen auf dem von Herdr bereitgestellten Branch, pusht ihn und erstellt bei Bedarf einen PR mit Zusammenfassung und `Close #<issue-id>`. Existiert für den Branch bereits ein PR, pusht er nur und lässt Titel sowie Beschreibung unverändert. Dafür müssen `git`, `gh` und eine passende GitHub-Authentifizierung verfügbar sein. Vor einem Run kann die vollständige Agenten- und Pipeline-Konfiguration unabhängig validiert werden. `factory plan <pipeline-name> [--input name=value]...` zeigt deklarierte Inputs, Steps, Typen und mögliche Übergänge; es simuliert keine Outcomes. Beide Befehle beenden sich bei Konfigurationsfehlern mit Exit-Code 2. Der Plan meldet fehlende oder unbekannte Inputs ohne Interaktion und startet ausdrücklich weder Agenten noch Shell-Kommandos oder erzeugt Run-Artefakte.
+
+```bash
+cargo run -p factory-cli --bin factory -- validate
+cargo run -p factory-cli --bin factory -- plan feature --input issue_url=https://github.com/owner/repo/issues/123
+```
+
+Start:
 
 ```bash
 cargo run -p factory-cli --bin factory -- feature --input issue_url=https://github.com/owner/repo/issues/123 "Löse das GitHub-Issue"
