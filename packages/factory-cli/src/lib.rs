@@ -470,7 +470,10 @@ fn initialize_agent_memories(
     let mut seen = HashSet::new();
     let mut memories = HashMap::new();
     for step in &pipeline.steps {
-        let StepKind::Agent { agent: agent_name } = &step.kind else {
+        let StepKind::Agent {
+            agent: agent_name, ..
+        } = &step.kind
+        else {
             continue;
         };
         if !seen.insert(agent_name.as_str()) {
@@ -1163,6 +1166,7 @@ mod tests {
             id: id.into(),
             kind: StepKind::Agent {
                 agent: agent.into(),
+                context: vec![],
             },
             transitions: vec![],
         }

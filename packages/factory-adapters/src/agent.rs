@@ -37,10 +37,12 @@ impl<E: AgentExecutor> AgentRunner for AgentRunnerAdapter<E> {
         previous_result: Option<&StepResult>,
     ) -> Result<StepOutput, String> {
         match &step.kind {
-            StepKind::Agent { agent: step_agent } if step_agent == &agent.name => {
-                self.executor.execute(agent, step, previous_result)
-            }
-            StepKind::Agent { agent: step_agent } => Err(format!(
+            StepKind::Agent {
+                agent: step_agent, ..
+            } if step_agent == &agent.name => self.executor.execute(agent, step, previous_result),
+            StepKind::Agent {
+                agent: step_agent, ..
+            } => Err(format!(
                 "agent step `{}` references `{step_agent}`, but runner received `{}`",
                 step.id, agent.name
             )),
@@ -89,6 +91,7 @@ mod tests {
             id: "build".into(),
             kind: StepKind::Agent {
                 agent: "coder".into(),
+                context: vec![],
             },
             transitions: vec![],
         };

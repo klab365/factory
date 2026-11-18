@@ -15,6 +15,13 @@ steps:
   - id: planner
     type: agent
     agent: planner
+    context:
+      task:
+        from: run.task
+      issue_url:
+        from: inputs.issue_url
+      issue:
+        from: steps.issue-intake.output
     transitions:
       - outcome: success
         target_step: build
@@ -22,6 +29,19 @@ steps:
   - id: build
     type: agent
     agent: coder
+    context:
+      task:
+        from: run.task
+      issue:
+        from: steps.issue-intake.output
+      plan:
+        from: steps.planner.output
+      review_feedback:
+        from: steps.review.handoff
+        optional: true
+      human_feedback:
+        from: steps.approval.handoff.answer
+        optional: true
     transitions:
       - outcome: success
         target_step: review
@@ -31,6 +51,16 @@ steps:
   - id: review
     type: agent
     agent: reviewer
+    context:
+      task:
+        from: run.task
+      issue:
+        from: steps.issue-intake.output
+      coder_summary:
+        from: steps.build.output
+      human_feedback:
+        from: steps.approval.handoff.answer
+        optional: true
     transitions:
       - outcome: changes_requested
         target_step: build
@@ -43,8 +73,31 @@ steps:
     args: [test]
     transitions:
       - outcome: success
+        target_step: approval
+
+  - id: approval
+    type: human
+    prompt: |
+      Tests sind erfolgreich. Gib konkretes Feedback ein, wenn noch etwas geändert
+      werden soll. Der Coder setzt es um und danach laufen Review und Tests erneut.
+      Antworte exakt mit `approved`, wenn alles passt und ich committen, pushen und
+      einen Pull Request erstellen darf.
+    approval_keyword: approved
+    transitions:
+      - outcome: feedback
+        target_step: build
+      - outcome: approved
         target_step: publish
 
   - id: publish
     type: agent
     agent: publisher
+    context:
+      task:
+        from: run.task
+      issue_url:
+        from: inputs.issue_url
+      test_result:
+        from: steps.test.output
+      review_result:
+        from: steps.review.output

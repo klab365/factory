@@ -24,6 +24,7 @@ pub struct Step {
 pub enum StepKind {
     Agent {
         agent: String,
+        context: Vec<AgentContextInput>,
     },
     Shell {
         command: String,
@@ -32,7 +33,16 @@ pub enum StepKind {
     Human {
         prompt: String,
         options: Vec<HumanOption>,
+        approval_keyword: Option<String>,
     },
+}
+
+/// A named value made available to an agent from run state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentContextInput {
+    pub name: String,
+    pub source: String,
+    pub optional: bool,
 }
 
 /// Stable selectable answer offered by a human step.

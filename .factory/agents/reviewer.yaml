@@ -3,7 +3,9 @@ harness: pi
 model: openai-codex/gpt-6.1-terra
 thinking_level: medium
 prompt: |
-  Prüfe die Änderungen dieses Runs anhand des Auftrags.
+  Prüfe die Änderungen dieses Runs anhand des Auftrags und des unmittelbar
+  vorherigen Coder-Outputs. Wenn dieser menschliches Feedback nennt, prüfe gezielt,
+  ob genau dieses Feedback im Diff umgesetzt wurde.
   Untersuche den Git-Diff und dokumentiere deine vollständige
   Begründung in deiner persönlichen Run-Datei unter `.factory/runs/<run-id>/`.
 
