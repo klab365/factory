@@ -3,6 +3,11 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepHandoff {
     Review(ReviewHandoff),
+    Human {
+        prompt: String,
+        answer: String,
+        option_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

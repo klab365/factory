@@ -10,7 +10,8 @@ use std::{
 };
 
 use factory_core::{
-    AgentDefinition, ModelRef, Pipeline, PipelineInput, Step, StepKind, ThinkingLevel, Transition,
+    AgentContextInput, AgentDefinition, HumanOption, ModelRef, Pipeline, PipelineInput, Step,
+    StepKind, ThinkingLevel, Transition,
 };
 use serde::{Deserialize, Serialize};
 
@@ -255,15 +256,44 @@ fn pipeline_to_dto(pipeline: &Pipeline) -> PipelineDto {
                     })
                     .collect();
                 match &step.kind {
-                    StepKind::Agent { agent } => StepDto::Agent {
+                    StepKind::Agent { agent, context } => StepDto::Agent {
                         id: step.id.clone(),
                         agent: agent.clone(),
+                        context: context
+                            .iter()
+                            .map(|input| {
+                                (
+                                    input.name.clone(),
+                                    AgentContextDto {
+                                        from: input.source.clone(),
+                                        optional: input.optional,
+                                    },
+                                )
+                            })
+                            .collect(),
                         transitions,
                     },
                     StepKind::Shell { command, args } => StepDto::Shell {
                         id: step.id.clone(),
                         command: command.clone(),
                         args: args.clone(),
+                        transitions,
+                    },
+                    StepKind::Human {
+                        prompt,
+                        options,
+                        approval_keyword,
+                    } => StepDto::Human {
+                        id: step.id.clone(),
+                        prompt: prompt.clone(),
+                        approval_keyword: approval_keyword.clone(),
+                        options: options
+                            .iter()
+                            .map(|option| HumanOptionDto {
+                                id: option.id.clone(),
+                                label: option.label.clone(),
+                            })
+                            .collect(),
                         transitions,
                     },
                 }
@@ -387,6 +417,8 @@ enum StepDto {
         id: String,
         agent: String,
         #[serde(default)]
+        context: std::collections::BTreeMap<String, AgentContextDto>,
+        #[serde(default)]
         transitions: Vec<TransitionDto>,
     },
     Shell {
@@ -397,6 +429,62 @@ enum StepDto {
         #[serde(default)]
         transitions: Vec<TransitionDto>,
     },
+    Human {
+        id: String,
+        prompt: String,
+        #[serde(default)]
+        approval_keyword: Option<String>,
+        #[serde(default)]
+        options: Vec<HumanOptionDto>,
+        #[serde(default)]
+        transitions: Vec<TransitionDto>,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+struct AgentContextDto {
+    from: String,
+    #[serde(default)]
+    optional: bool,
+}
+
+fn is_valid_context_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+fn validate_context_source(
+    source: &str,
+    inputs: &HashSet<String>,
+    step_ids: &HashSet<String>,
+) -> Result<(), String> {
+    let parts: Vec<_> = source.split('.').collect();
+    match parts.as_slice() {
+        ["run", "task"] => Ok(()),
+        ["inputs", input] if inputs.contains(*input) => Ok(()),
+        ["steps", step_id, "output"] if step_ids.contains(*step_id) => Ok(()),
+        ["steps", step_id, "handoff"] if step_ids.contains(*step_id) => Ok(()),
+        ["steps", step_id, "handoff", field]
+            if step_ids.contains(*step_id) && is_valid_context_name(field) =>
+        {
+            Ok(())
+        }
+        ["inputs", input] => Err(format!("references undeclared pipeline input `{input}`")),
+        ["steps", step_id, ..] if !step_ids.contains(*step_id) => {
+            Err(format!("references unknown step `{step_id}`"))
+        }
+        _ => Err(format!(
+            "invalid source `{source}`; expected `run.task`, `inputs.<key>`, or `steps.<id>.output|handoff[.<field>]`"
+        )),
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct HumanOptionDto {
+    id: String,
+    label: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -467,6 +555,15 @@ fn validate_pipeline(
     }
 
     let agent_names: HashSet<&str> = agents.iter().map(|agent| agent.name.as_str()).collect();
+    let declared_step_ids: HashSet<String> = dto
+        .steps
+        .iter()
+        .map(|step| match step {
+            StepDto::Agent { id, .. } | StepDto::Shell { id, .. } | StepDto::Human { id, .. } => {
+                id.clone()
+            }
+        })
+        .collect();
     let mut step_ids = HashSet::new();
     let mut steps = Vec::with_capacity(dto.steps.len());
     for step in dto.steps {
@@ -474,6 +571,7 @@ fn validate_pipeline(
             StepDto::Agent {
                 id,
                 agent,
+                context,
                 transitions,
             } => {
                 if !agent_names.contains(agent.as_str()) {
@@ -485,7 +583,91 @@ fn validate_pipeline(
                         ),
                     ));
                 }
-                (id, StepKind::Agent { agent }, transitions)
+                let context = context
+                    .into_iter()
+                    .map(|(name, input)| {
+                        if !is_valid_context_name(&name) {
+                            return Err(invalid(
+                                path,
+                                format!(
+                                    "pipeline `{}` step `{id}` has invalid context name `{name}`",
+                                    dto.name
+                                ),
+                            ));
+                        }
+                        if let Err(message) =
+                            validate_context_source(&input.from, &input_names, &declared_step_ids)
+                        {
+                            return Err(invalid(
+                                path,
+                                format!(
+                                    "pipeline `{}` step `{id}` context `{name}`: {message}",
+                                    dto.name
+                                ),
+                            ));
+                        }
+                        Ok(AgentContextInput {
+                            name,
+                            source: input.from,
+                            optional: input.optional,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                (id, StepKind::Agent { agent, context }, transitions)
+            }
+            StepDto::Human {
+                id,
+                prompt,
+                approval_keyword,
+                options,
+                transitions,
+            } => {
+                if prompt.trim().is_empty() {
+                    return Err(invalid(
+                        path,
+                        format!(
+                            "pipeline `{}` step `{id}` field `prompt` must not be empty",
+                            dto.name
+                        ),
+                    ));
+                }
+                if let Some(keyword) = &approval_keyword
+                    && (keyword.trim().is_empty() || !options.is_empty())
+                {
+                    return Err(invalid(
+                        path,
+                        format!(
+                            "pipeline `{}` step `{id}` approval_keyword must be non-empty and cannot be combined with options",
+                            dto.name
+                        ),
+                    ));
+                }
+                let mut option_ids = HashSet::new();
+                let options = options.into_iter().map(|option| {
+                    if option.id.trim().is_empty()
+                        || option.id.trim() != option.id
+                        || option.label.trim().is_empty()
+                        || !option_ids.insert(option.id.clone())
+                    {
+                        return Err(invalid(
+                            path,
+                            format!(
+                                "pipeline `{}` step `{id}` has an empty, whitespace-padded, or duplicate human option ID/label",
+                                dto.name
+                            ),
+                        ));
+                    }
+                    Ok(HumanOption { id: option.id, label: option.label })
+                }).collect::<Result<Vec<_>, _>>()?;
+                (
+                    id,
+                    StepKind::Human {
+                        prompt,
+                        options,
+                        approval_keyword,
+                    },
+                    transitions,
+                )
             }
             StepDto::Shell {
                 id,
@@ -612,7 +794,8 @@ mod tests {
         assert_eq!(
             config.pipelines[0].steps[0].kind,
             StepKind::Agent {
-                agent: "coder".into()
+                agent: "coder".into(),
+                context: vec![],
             }
         );
         assert_eq!(
@@ -634,9 +817,27 @@ mod tests {
         let agent_path = project.file(".factory/agents/coder.yml", YAML_AGENT);
         project.file(
             ".factory/pipelines/feature.yaml",
-            "name: feature\ninputs:\n  - key: task\n    description: Task to implement\nsteps:\n  - id: build\n    type: agent\n    agent: coder\n",
+            "name: feature\ninputs:\n  - key: task\n    description: Task to implement\nsteps:\n  - id: build\n    type: agent\n    agent: coder\n    context:\n      task:\n        from: run.task\n      request:\n        from: inputs.task\n",
         );
         let original = load_configuration(&project.0).unwrap();
+        assert_eq!(
+            original.pipelines[0].steps[0].kind,
+            StepKind::Agent {
+                agent: "coder".into(),
+                context: vec![
+                    AgentContextInput {
+                        name: "request".into(),
+                        source: "inputs.task".into(),
+                        optional: false,
+                    },
+                    AgentContextInput {
+                        name: "task".into(),
+                        source: "run.task".into(),
+                        optional: false,
+                    },
+                ],
+            }
+        );
         let run_dir = project.0.join(".factory/runs/run-1");
         fs::create_dir_all(&run_dir).unwrap();
         let snapshot_path = run_dir.join("config.json");
@@ -655,6 +856,31 @@ mod tests {
             load_configuration_snapshot(&snapshot_path).unwrap(),
             original
         );
+    }
+
+    #[test]
+    fn loads_repository_feature_pipeline_context_bindings() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let configuration = load_configuration(root).unwrap();
+        let feature = configuration
+            .pipelines
+            .iter()
+            .find(|pipeline| pipeline.name == "feature")
+            .unwrap();
+        let StepKind::Agent { context, .. } = &feature
+            .steps
+            .iter()
+            .find(|step| step.id == "build")
+            .unwrap()
+            .kind
+        else {
+            panic!("build step should be an agent");
+        };
+        assert!(context.iter().any(|input| {
+            input.name == "human_feedback"
+                && input.source == "steps.approval.handoff.answer"
+                && input.optional
+        }));
     }
 
     #[test]
@@ -769,6 +995,31 @@ mod tests {
         let error = load_configuration(&project.0).unwrap_err();
         assert!(error.message.contains("pipeline `feature` step `build`"));
         assert!(error.message.contains("unknown agent `missing`"));
+    }
+
+    #[test]
+    fn rejects_human_option_ids_with_surrounding_whitespace_and_normalization_collisions() {
+        for ids in [
+            [" approve", "reject"],
+            ["approve ", "reject"],
+            ["approve", " approve "],
+        ] {
+            let project = TempProject::new();
+            project.file(".factory/agents/coder.toml", AGENT);
+            let options = ids
+                .iter()
+                .map(|id| format!("{{ id = '{id}', label = 'Option' }}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            project.file(
+                ".factory/pipelines/feature.toml",
+                &format!(
+                    "name = 'feature'\n[[inputs]]\nkey = 'task'\ndescription = 'Task'\n[[steps]]\nid = 'ask'\ntype = 'human'\nprompt = 'Choose'\noptions = [{options}]\n"
+                ),
+            );
+            let error = load_configuration(&project.0).unwrap_err();
+            assert!(error.message.contains("whitespace-padded"), "{error}");
+        }
     }
 
     #[test]

@@ -28,7 +28,12 @@ pub trait AgentRunner {
 
 /// Port for executing a shell step. Implementations belong in adapters.
 pub trait ShellRunner {
-    fn run(&mut self, step: &Step) -> Result<StepOutput, String>;
+    /// Executes a shell step with the immediately preceding pipeline result, if any.
+    fn run(
+        &mut self,
+        step: &Step,
+        previous_result: Option<&StepResult>,
+    ) -> Result<StepOutput, String>;
 }
 
 /// Persistence port called before and after each step execution.
@@ -36,6 +41,16 @@ pub trait RunJournal {
     fn step_started(&mut self, step_id: &str) -> Result<(), String>;
     fn step_completed(&mut self, result: &StepResult) -> Result<(), String>;
     fn step_failed(&mut self, step_id: &str, error: &str) -> Result<(), String>;
+
+    /// Obtains a human answer through an application-level interaction adapter.
+    fn human_answer(
+        &mut self,
+        _step_id: &str,
+        _prompt: &str,
+        _options: &[crate::HumanOption],
+    ) -> Result<String, String> {
+        Err("human input is unavailable in this context".into())
+    }
 
     /// Called when a reviewer repeats an identical structured rejection. Return false to stop.
     fn confirm_repeated_review_feedback(&mut self, _result: &StepResult) -> Result<bool, String> {

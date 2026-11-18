@@ -45,16 +45,59 @@ impl ShellRunnerAdapter {
         Self { config }
     }
 
-    fn execute(&self, step: &Step, command: &str, args: &[String]) -> Result<StepOutput, String> {
+    fn execute(
+        &self,
+        step: &Step,
+        command: &str,
+        args: &[String],
+        previous_result: Option<&factory_core::features::StepResult>,
+    ) -> Result<StepOutput, String> {
         let resolved_args = args
             .iter()
             .map(|arg| substitute_inputs(arg, &self.config.inputs, &step.id))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut child = Command::new(command)
+        let mut command = Command::new(command);
+        command
             .args(&resolved_args)
             .current_dir(&self.config.working_directory)
             .env_clear()
-            .envs(&self.config.environment)
+            .envs(&self.config.environment);
+        if let Some(previous) = previous_result {
+            let handoff = match &previous.handoff {
+                Some(factory_core::features::StepHandoff::Human {
+                    prompt,
+                    answer,
+                    option_id,
+                }) => {
+                    serde_json::json!({
+                        "kind": "human",
+                        "prompt": prompt,
+                        "answer": answer,
+                        "option_id": option_id,
+                    })
+                }
+                Some(factory_core::features::StepHandoff::Review(review)) => {
+                    serde_json::json!({"kind": "review", "findings": review.findings.iter().map(|finding| serde_json::json!({
+                        "title": finding.title,
+                        "location": finding.location,
+                        "problem": finding.problem,
+                        "required_change": finding.required_change,
+                        "verification": finding.verification,
+                    })).collect::<Vec<_>>()})
+                }
+                None => serde_json::Value::Null,
+            };
+            let structured = serde_json::json!({
+                "step_id": previous.step_id,
+                "outcome": previous.outcome,
+                "output": previous.output,
+                "exit_code": previous.exit_code,
+                "runner_attempts": previous.runner_attempts,
+                "handoff": handoff,
+            });
+            command.env("FACTORY_PREVIOUS_STEP_RESULT", structured.to_string());
+        }
+        let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -107,11 +150,15 @@ impl ShellRunnerAdapter {
 }
 
 impl ShellRunner for ShellRunnerAdapter {
-    fn run(&mut self, step: &Step) -> Result<StepOutput, String> {
+    fn run(
+        &mut self,
+        step: &Step,
+        previous_result: Option<&factory_core::features::StepResult>,
+    ) -> Result<StepOutput, String> {
         match &step.kind {
-            StepKind::Shell { command, args } => self.execute(step, command, args),
-            StepKind::Agent { .. } => Err(format!(
-                "shell runner cannot execute agent step `{}`",
+            StepKind::Shell { command, args } => self.execute(step, command, args, previous_result),
+            StepKind::Agent { .. } | StepKind::Human { .. } => Err(format!(
+                "shell runner cannot execute non-shell step `{}`",
                 step.id
             )),
         }
@@ -235,7 +282,7 @@ mod tests {
                 "printf '%s:%s' \"$PWD\" \"$FACTORY_TEST_VALUE\"; exit 7",
             ],
         );
-        let output = runner.run(&step).unwrap();
+        let output = runner.run(&step, None).unwrap();
         assert_eq!(output.outcome, "failure");
         assert_eq!(output.exit_code, Some(7));
         assert_eq!(output.output, format!("{}:controlled", directory.display()));
@@ -256,10 +303,10 @@ mod tests {
         );
         let mut runner = ShellRunnerAdapter::new(config);
         let output = runner
-            .run(&shell_step(
-                "sh",
-                &["-c", "printf '%s' \"$1\"", "sh", "{{target}}"],
-            ))
+            .run(
+                &shell_step("sh", &["-c", "printf '%s' \"$1\"", "sh", "{{target}}"]),
+                None,
+            )
             .unwrap();
         assert_eq!(output.outcome, "success");
         assert!(output.output.contains("; touch"));
@@ -297,7 +344,7 @@ mod tests {
                 "url,title,body,labels",
             ],
         );
-        let output = runner.run(&step).unwrap();
+        let output = runner.run(&step, None).unwrap();
         assert_eq!(output.outcome, "success");
         assert_eq!(
             output.output,
@@ -315,7 +362,10 @@ mod tests {
             .insert("GH_TOKEN".into(), "sensitive-test-token".into());
         let mut runner = ShellRunnerAdapter::new(config);
         let output = runner
-            .run(&shell_step("sh", &["-c", "printf '%s' \"$GH_TOKEN\""]))
+            .run(
+                &shell_step("sh", &["-c", "printf '%s' \"$GH_TOKEN\""]),
+                None,
+            )
             .unwrap();
         assert_eq!(output.outcome, "success");
         assert_eq!(output.output, "[REDACTED]");
@@ -324,11 +374,47 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn passes_previous_human_result_as_structured_json_environment() {
+        use factory_core::features::{StepHandoff, StepResult};
+
+        let mut runner =
+            ShellRunnerAdapter::new(ShellRunnerConfig::new(".", Duration::from_secs(2)));
+        let previous = StepResult {
+            step_id: "question".into(),
+            outcome: "success".into(),
+            output: "yes".into(),
+            exit_code: None,
+            runner_attempts: 1,
+            handoff: Some(StepHandoff::Human {
+                prompt: "Continue?".into(),
+                answer: "yes".into(),
+                option_id: Some("yes".into()),
+            }),
+        };
+        let output = runner
+            .run(
+                &shell_step(
+                    "sh",
+                    &["-c", "printf '%s' \"$FACTORY_PREVIOUS_STEP_RESULT\""],
+                ),
+                Some(&previous),
+            )
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&output.output).unwrap();
+        assert_eq!(json["step_id"], "question");
+        assert_eq!(json["handoff"]["kind"], "human");
+        assert_eq!(json["handoff"]["prompt"], "Continue?");
+        assert_eq!(json["handoff"]["answer"], "yes");
+        assert_eq!(json["handoff"]["option_id"], "yes");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn terminates_processes_that_exceed_the_timeout() {
         let config = ShellRunnerConfig::new(".", Duration::from_millis(30));
         let mut runner = ShellRunnerAdapter::new(config);
         let output = runner
-            .run(&shell_step("sh", &["-c", "exec sleep 2"]))
+            .run(&shell_step("sh", &["-c", "exec sleep 2"]), None)
             .unwrap();
         assert_eq!(output.outcome, "failure");
         assert_eq!(output.exit_code, None);

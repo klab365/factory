@@ -187,7 +187,7 @@ pub fn run_pipeline_with_journal<A: AgentRunner, S: ShellRunner, J: RunJournal>(
             .map_err(|message| RunError::JournalFailed { message })?;
 
         let execution = match &step.kind {
-            StepKind::Agent { agent } => {
+            StepKind::Agent { agent, .. } => {
                 let definition = agent_index.get(agent.as_str()).copied().ok_or_else(|| {
                     RunError::MissingAgent {
                         step_id: step.id.clone(),
@@ -196,7 +196,60 @@ pub fn run_pipeline_with_journal<A: AgentRunner, S: ShellRunner, J: RunJournal>(
                 })?;
                 agent_runner.run(definition, step, results.last())
             }
-            StepKind::Shell { .. } => shell_runner.run(step),
+            StepKind::Shell { .. } => shell_runner.run(step, results.last()),
+            StepKind::Human {
+                prompt,
+                options,
+                approval_keyword,
+            } => {
+                let answer =
+                    journal
+                        .human_answer(&step.id, prompt, options)
+                        .map_err(|message| RunError::RunnerFailed {
+                            step_id: step.id.clone(),
+                            message,
+                        })?;
+                let option_id = if options.is_empty() {
+                    None
+                } else {
+                    let Some(option) = options.iter().find(|option| option.id == answer) else {
+                        return Err(RunError::RunnerFailed {
+                            step_id: step.id.clone(),
+                            message: format!(
+                                "answer must match one of the option IDs: {}",
+                                options
+                                    .iter()
+                                    .map(|option| option.id.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                        });
+                    };
+                    Some(option.id.clone())
+                };
+                if answer.trim().is_empty() {
+                    return Err(RunError::RunnerFailed {
+                        step_id: step.id.clone(),
+                        message: "human answer must not be empty".into(),
+                    });
+                }
+                let outcome = match approval_keyword {
+                    Some(keyword) if answer == *keyword => "approved",
+                    Some(_) => "feedback",
+                    None => "success",
+                };
+                Ok(super::ports::StepOutput {
+                    outcome: outcome.into(),
+                    output: answer.clone(),
+                    exit_code: None,
+                    attempts: 1,
+                    handoff: Some(super::run::StepHandoff::Human {
+                        prompt: prompt.clone(),
+                        answer,
+                        option_id,
+                    }),
+                })
+            }
         };
         let output = match execution {
             Ok(output) => output,
@@ -415,7 +468,12 @@ mod tests {
     }
 
     impl ShellRunner for FakeRunner {
-        fn run(&mut self, _: &Step) -> Result<StepOutput, String> {
+        fn run(
+            &mut self,
+            _: &Step,
+            previous_result: Option<&StepResult>,
+        ) -> Result<StepOutput, String> {
+            self.previous_results.push(previous_result.cloned());
             self.next()
         }
     }
@@ -435,6 +493,7 @@ mod tests {
             id: id.into(),
             kind: StepKind::Agent {
                 agent: "coder".into(),
+                context: vec![],
             },
             transitions: transitions
                 .iter()

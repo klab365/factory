@@ -22,4 +22,15 @@ cargo run -p factory-cli --bin factory -- run resume <run-id> --retry-current
 
 Pipeline-Eingaben werden als `inputs` mit `key` und `description` deklariert. Ein Start ohne Task, z. B. `factory feature` oder `cargo run -p factory-cli --bin factory -- feature`, fragt die Pipeline-Eingaben und danach den Task interaktiv ab. Fehlende Eingaben können beim Start auch als `--input name=value` übergeben werden. In Shell-Argumenten werden sie mit `{{name}}` eingesetzt; die Ersetzung erfolgt als separates Prozessargument. Der Issue-Intake in `feature.yaml` nutzt diese generische Funktion für `issue_url`. Die Issue-Daten werden als Step-Ergebnis gespeichert und dem Planner-Agenten als Handoff sowie in dessen Run-Markdown übergeben. `gh` muss installiert und authentifiziert sein.
 
+Agent-Steps können unter `context` benannte Werte deklarieren, die dem Agenten als JSON mitgegeben werden. `from` unterstützt `run.task`, `inputs.<key>`, `steps.<id>.output`, `steps.<id>.handoff` und `steps.<id>.handoff.<field>`. `optional: true` lässt eine Quelle aus, solange sie noch nicht verfügbar ist. Bei wiederholten Steps wird jeweils das jüngste abgeschlossene Ergebnis verwendet. Beispiel:
+
+```yaml
+context:
+  issue:
+    from: steps.issue-intake.output
+  feedback:
+    from: steps.approval.handoff.answer
+    optional: true
+```
+
 Shell-Steps starten echte Prozesse. Nur vertrauenswürdige Pipelines ausführen.

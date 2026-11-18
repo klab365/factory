@@ -33,6 +33,7 @@ impl Error for RunStoreError {}
 pub enum PersistedRunStatus {
     Running,
     Interrupted,
+    WaitingForInput,
     Succeeded,
     Failed,
 }
@@ -44,6 +45,20 @@ pub enum StepAttemptStatus {
     Completed,
     Error,
     Interrupted,
+    WaitingForInput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingHuman {
+    pub step_id: String,
+    pub prompt: String,
+    pub options: Vec<PersistedHumanOption>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedHumanOption {
+    pub id: String,
+    pub label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,6 +66,11 @@ pub enum StepAttemptStatus {
 pub enum PersistedHandoff {
     Review {
         findings: Vec<PersistedReviewFinding>,
+    },
+    Human {
+        prompt: String,
+        answer: String,
+        option_id: Option<String>,
     },
 }
 
@@ -102,6 +122,15 @@ impl From<&PersistedStepResult> for StepResult {
 impl From<&StepHandoff> for PersistedHandoff {
     fn from(handoff: &StepHandoff) -> Self {
         match handoff {
+            StepHandoff::Human {
+                prompt,
+                answer,
+                option_id,
+            } => Self::Human {
+                prompt: prompt.clone(),
+                answer: answer.clone(),
+                option_id: option_id.clone(),
+            },
             StepHandoff::Review(review) => Self::Review {
                 findings: review
                     .findings
@@ -122,6 +151,15 @@ impl From<&StepHandoff> for PersistedHandoff {
 impl From<&PersistedHandoff> for StepHandoff {
     fn from(handoff: &PersistedHandoff) -> Self {
         match handoff {
+            PersistedHandoff::Human {
+                prompt,
+                answer,
+                option_id,
+            } => Self::Human {
+                prompt: prompt.clone(),
+                answer: answer.clone(),
+                option_id: option_id.clone(),
+            },
             PersistedHandoff::Review { findings } => Self::Review(ReviewHandoff {
                 findings: findings
                     .iter()
@@ -160,6 +198,8 @@ pub struct RunRecord {
     pub config_snapshot: String,
     pub status: PersistedRunStatus,
     pub current_step: Option<String>,
+    #[serde(default)]
+    pub pending_human: Option<PendingHuman>,
     pub started_at_ms: u128,
     pub updated_at_ms: u128,
     pub finished_at_ms: Option<u128>,
@@ -192,6 +232,7 @@ impl RunStore {
                 config_snapshot: "config.json".into(),
                 status: PersistedRunStatus::Running,
                 current_step: None,
+                pending_human: None,
                 started_at_ms: now,
                 updated_at_ms: now,
                 finished_at_ms: None,
@@ -247,7 +288,103 @@ impl RunStore {
                     | StepAttemptStatus::Error
                     | StepAttemptStatus::Interrupted
             )
-        )
+        ) && self.record.status != PersistedRunStatus::WaitingForInput
+    }
+
+    pub fn wait_for_human(
+        &mut self,
+        step_id: &str,
+        prompt: &str,
+        options: &[factory_core::HumanOption],
+    ) -> Result<(), RunStoreError> {
+        let previous_record = self.record.clone();
+        self.record.pending_human = Some(PendingHuman {
+            step_id: step_id.into(),
+            prompt: prompt.into(),
+            options: options
+                .iter()
+                .map(|o| PersistedHumanOption {
+                    id: o.id.clone(),
+                    label: o.label.clone(),
+                })
+                .collect(),
+        });
+        self.record.status = PersistedRunStatus::WaitingForInput;
+        if let Some(attempt) = self
+            .record
+            .steps
+            .iter_mut()
+            .rev()
+            .find(|s| s.step_id == step_id && s.status == StepAttemptStatus::Running)
+        {
+            attempt.status = StepAttemptStatus::WaitingForInput;
+        }
+        if let Err(error) = self.save() {
+            self.record = previous_record;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn answer_pending_human(&mut self, answer: &str) -> Result<StepResult, String> {
+        let pending = self
+            .record
+            .pending_human
+            .clone()
+            .ok_or("run has no pending human question")?;
+        let answer = answer.trim();
+        if answer.is_empty() {
+            return Err("Human answer must not be empty".into());
+        }
+        let option_id = if pending.options.is_empty() {
+            None
+        } else {
+            Some(
+                pending
+                    .options
+                    .iter()
+                    .find(|o| o.id == answer)
+                    .ok_or_else(|| {
+                        format!(
+                            "answer must match one of: {}",
+                            pending
+                                .options
+                                .iter()
+                                .map(|o| o.id.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    })?
+                    .id
+                    .clone(),
+            )
+        };
+        let result = StepResult {
+            step_id: pending.step_id.clone(),
+            outcome: "success".into(),
+            output: answer.into(),
+            exit_code: None,
+            runner_attempts: 1,
+            handoff: Some(StepHandoff::Human {
+                prompt: pending.prompt,
+                answer: answer.into(),
+                option_id,
+            }),
+        };
+        let attempt = self
+            .record
+            .steps
+            .iter_mut()
+            .rev()
+            .find(|s| s.step_id == result.step_id && s.status == StepAttemptStatus::WaitingForInput)
+            .ok_or("pending human step attempt is missing")?;
+        attempt.status = StepAttemptStatus::Completed;
+        attempt.finished_at_ms = Some(now_ms().map_err(|e| e.to_string())?);
+        attempt.result = Some(PersistedStepResult::from(&result));
+        self.record.pending_human = None;
+        self.record.status = PersistedRunStatus::Running;
+        self.save().map_err(|e| e.to_string())?;
+        Ok(result)
     }
 
     pub fn mark_interrupted(&mut self) -> Result<(), RunStoreError> {
@@ -333,13 +470,19 @@ impl RunJournal for RunStore {
 
     fn step_completed(&mut self, result: &StepResult) -> Result<(), String> {
         let Some(step) = self.record.steps.iter_mut().rev().find(|step| {
-            step.step_id == result.step_id && step.status == StepAttemptStatus::Running
+            step.step_id == result.step_id
+                && matches!(
+                    step.status,
+                    StepAttemptStatus::Running | StepAttemptStatus::WaitingForInput
+                )
         }) else {
             return Err(format!("no running attempt for step `{}`", result.step_id));
         };
         step.status = StepAttemptStatus::Completed;
         step.finished_at_ms = Some(now_ms().map_err(|error| error.to_string())?);
         step.result = Some(PersistedStepResult::from(result));
+        self.record.pending_human = None;
+        self.record.status = PersistedRunStatus::Running;
         self.save().map_err(|error| error.to_string())
     }
 

@@ -13,5 +13,10 @@ prompt: |
   Lies keine private Run-Datei eines anderen Agenten; der übergebene Handoff ist
   die maßgebliche Review-Eingabe.
 
+  Wenn der vorherige Step menschliches Feedback geliefert hat, setze dieses Feedback
+  vollständig um. Behandle den Text des Human-Handoffs als Änderungsanforderung.
+  Nenne in deinem finalen `output` das menschliche Feedback und kurz, wie du es
+  umgesetzt hast, damit der Reviewer genau diese Anforderung prüfen kann.
+
   Halte Änderungen eng am Auftrag, ergänze passende Tests und dokumentiere Änderungen,
   Tests und offene Punkte in deiner Run-Datei.

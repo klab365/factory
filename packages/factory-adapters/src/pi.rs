@@ -12,7 +12,7 @@ use std::{
 };
 
 use factory_core::{
-    AgentDefinition, Step, StepKind, ThinkingLevel,
+    AgentContextInput, AgentDefinition, Step, StepKind, ThinkingLevel,
     features::{ReviewFinding, ReviewHandoff, StepHandoff, StepOutput, StepResult},
 };
 use serde_json::Value;
@@ -65,7 +65,11 @@ impl PiAgentExecutor {
                 agent.harness, agent.name
             ));
         }
-        let StepKind::Agent { agent: step_agent } = &step.kind else {
+        let StepKind::Agent {
+            agent: step_agent,
+            context,
+        } = &step.kind
+        else {
             return Err(format!("step `{}` is not an agent step", step.id));
         };
         if step_agent != &agent.name {
@@ -86,13 +90,15 @@ impl PiAgentExecutor {
             ));
         }
         let handoff = record_handoff(memory, &agent.name, &step.id, previous_result)?;
+        let explicit_context = render_agent_context(memory, context)?;
         let prompt = format!(
-            "{}\n\nFactory pipeline step: `{}` (agent `{}`). Read the run context at `{}` before acting and update that same file with your findings and decisions.\n\n{}\n\nWhen finished, your final response MUST be exactly one JSON object with string keys `outcome` and `output`, plus optional `handoff`; do not wrap it in markdown. For reviewer outcome `changes_requested`, `handoff` is REQUIRED and must be {{\"kind\":\"review\",\"findings\":[{{\"title\":\"...\",\"location\":\"...\",\"problem\":\"...\",\"required_change\":\"...\",\"verification\":\"...\"}}]}}. Put all actionable review findings in that object; `output` is only a short summary. Omit `handoff` for all other outcomes. Allowed outcomes for this agent are: {}.",
+            "{}\n\nFactory pipeline step: `{}` (agent `{}`). Read the run context at `{}` before acting and update that same file with your findings and decisions.\n\nPrevious-step handoff:\n{}\n\nExplicit inputs for this step:\n{}\n\nWhen finished, your final response MUST be exactly one JSON object with string keys `outcome` and `output`, plus optional `handoff`; do not wrap it in markdown. For reviewer outcome `changes_requested`, `handoff` is REQUIRED and must be {{\"kind\":\"review\",\"findings\":[{{\"title\":\"...\",\"location\":\"...\",\"problem\":\"concrete gap\",\"required_change\":\"concrete change\",\"verification\":\"test or acceptance check\"}}]}}. Put all actionable review findings in that object; `output` is only a short summary. Omit `handoff` for all other outcomes. Allowed outcomes for this agent are: {}.",
             agent.prompt,
             step.id,
             agent.name,
             memory.display(),
             handoff,
+            explicit_context,
             allowed_outcomes(&agent.name).join(", ")
         );
         let mut command = Command::new(&self.executable);
@@ -198,6 +204,9 @@ impl PiAgentExecutor {
         if agent.name == "reviewer" && response.outcome == "changes_requested" {
             match response.handoff.as_ref() {
                 Some(StepHandoff::Review(review)) => validate_review_handoff(review)?,
+                Some(StepHandoff::Human { .. }) => {
+                    return Err("reviewer handoff must be review feedback".into());
+                }
                 None => {
                     return Err(
                         "reviewer changes_requested response must include a structured review handoff"
@@ -278,6 +287,71 @@ fn is_retryable_provider_error(error: &str) -> bool {
     .any(|marker| error.contains(marker))
 }
 
+fn render_agent_context(memory: &Path, bindings: &[AgentContextInput]) -> Result<String, String> {
+    if bindings.is_empty() {
+        return Ok("{}".into());
+    }
+    let run_path = memory
+        .parent()
+        .ok_or_else(|| "run memory has no parent directory".to_owned())?
+        .join("run.json");
+    let record: Value =
+        serde_json::from_slice(&fs::read(&run_path).map_err(|error| {
+            format!("could not read run context {}: {error}", run_path.display())
+        })?)
+        .map_err(|error| {
+            format!(
+                "could not parse run context {}: {error}",
+                run_path.display()
+            )
+        })?;
+    let mut resolved = serde_json::Map::new();
+    for binding in bindings {
+        match resolve_context_source(&record, &binding.source).filter(|value| !value.is_null()) {
+            Some(value) => {
+                resolved.insert(binding.name.clone(), value.clone());
+            }
+            None if binding.optional => {}
+            None => {
+                return Err(format!(
+                    "required agent context `{}` source `{}` is not available yet",
+                    binding.name, binding.source
+                ));
+            }
+        }
+    }
+    serde_json::to_string_pretty(&Value::Object(resolved))
+        .map_err(|error| format!("could not format agent context: {error}"))
+}
+
+fn resolve_context_source<'a>(record: &'a Value, source: &str) -> Option<&'a Value> {
+    let parts: Vec<_> = source.split('.').collect();
+    match parts.as_slice() {
+        ["run", "task"] => record.get("task"),
+        ["inputs", key] => record.get("inputs")?.get(*key),
+        ["steps", step_id, "output"] => latest_step_result(record, step_id)?.get("output"),
+        ["steps", step_id, "handoff"] => latest_step_result(record, step_id)?.get("handoff"),
+        ["steps", step_id, "handoff", field] => {
+            let handoff = latest_step_result(record, step_id)?.get("handoff")?;
+            handoff.get("data")?.get(*field)
+        }
+        _ => None,
+    }
+}
+
+fn latest_step_result<'a>(record: &'a Value, step_id: &str) -> Option<&'a Value> {
+    record
+        .get("steps")?
+        .as_array()?
+        .iter()
+        .rev()
+        .find(|step| {
+            step.get("step_id").and_then(Value::as_str) == Some(step_id)
+                && step.get("result").is_some_and(|result| !result.is_null())
+        })?
+        .get("result")
+}
+
 fn record_handoff(
     memory: &Path,
     receiving_agent: &str,
@@ -289,6 +363,17 @@ fn record_handoff(
     };
     let complete_output = match previous.handoff.as_ref() {
         Some(StepHandoff::Review(review)) => render_review_handoff(review),
+        Some(StepHandoff::Human {
+            prompt,
+            answer,
+            option_id,
+        }) => serde_json::json!({
+            "kind": "human",
+            "prompt": prompt,
+            "answer": answer,
+            "option_id": option_id,
+        })
+        .to_string(),
         None => previous.output.clone(),
     };
     let previous_output = if complete_output.chars().count() > MAX_HANDOFF_CHARS {
@@ -659,6 +744,57 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn resolves_named_agent_context_from_inputs_and_latest_step_results() {
+        let root =
+            std::env::temp_dir().join(format!("factory-agent-context-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let memory = root.join("00-coder.md");
+        std::fs::write(&memory, "coder memory").unwrap();
+        std::fs::write(
+            root.join("run.json"),
+            json!({
+                "task": "Implement issue",
+                "inputs": {"issue_url": "https://example.test/1"},
+                "steps": [
+                    {"step_id": "issue-intake", "result": {"output": "issue payload"}},
+                    {"step_id": "approval", "result": {
+                        "handoff": {"kind": "human", "data": {"answer": "Add a test"}}
+                    }}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let context = render_agent_context(
+            &memory,
+            &[
+                AgentContextInput {
+                    name: "issue_url".into(),
+                    source: "inputs.issue_url".into(),
+                    optional: false,
+                },
+                AgentContextInput {
+                    name: "issue".into(),
+                    source: "steps.issue-intake.output".into(),
+                    optional: false,
+                },
+                AgentContextInput {
+                    name: "feedback".into(),
+                    source: "steps.approval.handoff.answer".into(),
+                    optional: false,
+                },
+            ],
+        )
+        .unwrap();
+        let context: Value = serde_json::from_str(&context).unwrap();
+        assert_eq!(context["issue_url"], "https://example.test/1");
+        assert_eq!(context["issue"], "issue payload");
+        assert_eq!(context["feedback"], "Add a test");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn parses_only_exact_structured_response_from_final_assistant_event() {
         let transcript = format!(
             "{}\n{}\n",
@@ -846,6 +982,7 @@ mod tests {
             id: "implement".into(),
             kind: StepKind::Agent {
                 agent: "coder".into(),
+                context: vec![],
             },
             transitions: vec![],
         };
@@ -945,6 +1082,7 @@ mod tests {
             id: "implement".into(),
             kind: StepKind::Agent {
                 agent: "coder".into(),
+                context: vec![],
             },
             transitions: vec![],
         };
@@ -970,6 +1108,7 @@ mod tests {
             id: "build".into(),
             kind: StepKind::Agent {
                 agent: "coder".into(),
+                context: vec![],
             },
             transitions: vec![],
         };
