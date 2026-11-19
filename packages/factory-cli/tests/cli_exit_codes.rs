@@ -3,8 +3,11 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Output},
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
 struct Fixture {
     root: PathBuf,
@@ -16,7 +19,11 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("factory-cli-test-{unique}"));
+        let fixture_id = FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "factory-cli-test-{}-{unique}-{fixture_id}",
+            std::process::id()
+        ));
         fs::create_dir_all(root.join(".factory/pipelines")).unwrap();
         fs::create_dir_all(root.join(".factory/agents")).unwrap();
         Self { root }

@@ -406,6 +406,17 @@ fn run_management_command(args: &[String]) -> u8 {
         }
         "cancel" if args.len() == 3 => match store.cancel() {
             Ok(()) => {
+                if let Some(step) = store.record().steps.iter().rev().find(|step| {
+                    step.status == factory_adapters::run_store::StepAttemptStatus::Cancelled
+                }) && let Err(error) = append_pipeline_history(
+                    store.run_dir(),
+                    &step.step_id,
+                    step.attempt,
+                    "cancelled",
+                ) {
+                    eprintln!("Could not append pipeline history: {error}");
+                    return EXIT_EXECUTION_ERROR;
+                }
                 println!("Run `{run_id}` cancelled");
                 EXIT_SUCCESS
             }
@@ -507,7 +518,19 @@ fn resume_run(
     if store.record().status == PersistedRunStatus::WaitingForInput {
         let answer = read_resume_answer(store);
         match answer.and_then(|answer| store.answer_pending_human(&answer)) {
-            Ok(result) => completed.push(result),
+            Ok(result) => {
+                let attempt = store.record().steps.last().map_or(1, |step| step.attempt);
+                if let Err(error) = append_pipeline_history(
+                    store.run_dir(),
+                    &result.step_id,
+                    attempt,
+                    &result.outcome,
+                ) {
+                    eprintln!("Could not append pipeline history: {error}");
+                    return EXIT_EXECUTION_ERROR;
+                }
+                completed.push(result);
+            }
             Err(error) => {
                 eprintln!("Human answer error: {error}");
                 return EXIT_USAGE_ERROR;
@@ -702,7 +725,7 @@ fn initialize_agent_memories(
             .collect();
         let path = run_dir.join(format!("{index:02}-{slug}.md"));
         let content = format!(
-            "# Run memory: {}\n\nPipeline: {}\n\n## Auftrag\n\n{}\n\n## Verlauf\n\n<!-- Der Agent ergänzt hier Ergebnisse, Entscheidungen und offene Punkte. -->\n",
+            "# Run memory: {}\n\nPipeline: {}\n\n## Auftrag\n\n{}\n\n## Verlauf\n\n<!-- Chronologische Einträge append-only als `### <ID>. Verlauf: Step ... (Versuch ...) — Outcome ...; Handoff <ID>` ergänzen. -->\n",
             agent.name, pipeline.name, task
         );
         if !path.exists() {
@@ -713,6 +736,151 @@ fn initialize_agent_memories(
         memories.insert(agent.name.clone(), path);
     }
     Ok(memories)
+}
+
+fn append_pipeline_history(
+    run_dir: &std::path::Path,
+    step_id: &str,
+    attempt: u32,
+    outcome: &str,
+) -> Result<(), String> {
+    let mut files = fs::read_dir(run_dir)
+        .map_err(|error| format!("could not read run directory for history: {error}"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension().is_some_and(|extension| extension == "md")
+                && path
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.split_once('-').is_some_and(|(prefix, _)| {
+                            !prefix.is_empty() && prefix.bytes().all(|byte| byte.is_ascii_digit())
+                        })
+                    })
+        })
+        .filter(|path| {
+            fs::read_to_string(path).is_ok_and(|content| content.starts_with("# Run memory:"))
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    if files.is_empty() {
+        return Ok(());
+    }
+    let mut next_id = fs::read(run_dir.join("run.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|record| {
+            record
+                .get("steps")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+        })
+        .unwrap_or(1);
+    for path in &files {
+        let Ok(content) = fs::read_to_string(path) else {
+            continue;
+        };
+        for line in content.lines() {
+            if let Some(id) = line
+                .strip_prefix("### ")
+                .and_then(|line| line.split_once(". Verlauf:").map(|(id, _)| id))
+                .and_then(|id| id.parse::<usize>().ok())
+            {
+                next_id = next_id.max(id + 1);
+            }
+        }
+    }
+    let (incoming_step, incoming_attempt) = incoming_step_attempt(run_dir, step_id, attempt);
+    for path in files {
+        let content = fs::read_to_string(&path)
+            .map_err(|error| format!("could not read run memory for history: {error}"))?;
+        let memory_agent = content
+            .lines()
+            .find_map(|line| line.strip_prefix("# Run memory: "))
+            .unwrap_or_default();
+        let mut references = Vec::new();
+        let mut findings = Vec::new();
+        let mut matching_handoff = false;
+        for line in content.lines() {
+            if line.starts_with("## ") && line.contains(". Handoff:") {
+                matching_handoff = line
+                    .contains(&format!("Step `{incoming_step}` → Agent `{memory_agent}`"))
+                    && line.contains(&format!("/ Step `{step_id}`"))
+                    && line.contains(&format!("(Versuch {incoming_attempt})"));
+                if matching_handoff && let Some((id, _)) = line.split_once(". Handoff:") {
+                    references.push(id.trim_start_matches("## ").to_owned());
+                }
+            } else if line.starts_with("## ") {
+                matching_handoff = false;
+            } else if matching_handoff {
+                let finding_id = line
+                    .strip_prefix("### ")
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .or_else(|| {
+                        line.strip_prefix("- Finding ")
+                            .and_then(|rest| rest.split_once(':').map(|(id, _)| id))
+                    });
+                if let Some(id) = finding_id.filter(|id| id.contains('.')) {
+                    findings.push(id.to_owned());
+                }
+            }
+        }
+        references.sort();
+        references.dedup();
+        findings.sort();
+        findings.dedup();
+        let reference_text = if references.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; Handoff {}{}",
+                references.join(", "),
+                if findings.is_empty() {
+                    String::new()
+                } else {
+                    format!("; Findings {}", findings.join(", "))
+                }
+            )
+        };
+        let entry = format!(
+            "\n\n## Verlauf – Fortsetzung {next_id}\n\n### {next_id}. Verlauf: Step `{step_id}` (Versuch {attempt}) — Outcome `{outcome}`{reference_text}\n"
+        );
+        use std::io::Write as _;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .map_err(|error| format!("could not append pipeline history: {error}"))?;
+        file.write_all(entry.as_bytes())
+            .map_err(|error| format!("could not append pipeline history: {error}"))?;
+    }
+    Ok(())
+}
+
+fn incoming_step_attempt(run_dir: &std::path::Path, step_id: &str, attempt: u32) -> (String, u32) {
+    let record = fs::read(run_dir.join("run.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let Some(steps) = record
+        .as_ref()
+        .and_then(|record| record.get("steps"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return (step_id.to_owned(), attempt);
+    };
+    let current = steps.iter().rposition(|step| {
+        step.get("step_id").and_then(serde_json::Value::as_str) == Some(step_id)
+            && step.get("attempt").and_then(serde_json::Value::as_u64) == Some(attempt as u64)
+    });
+    current
+        .and_then(|index| index.checked_sub(1).map(|previous| &steps[previous]))
+        .and_then(|step| {
+            Some((
+                step.get("step_id")?.as_str()?.to_owned(),
+                step.get("attempt")?.as_u64()? as u32,
+            ))
+        })
+        .unwrap_or_else(|| (step_id.to_owned(), attempt))
 }
 
 fn prompt_value(prompt: &str) -> Result<String, String> {
@@ -816,6 +984,19 @@ impl RunJournal for ConsoleRunJournal<'_> {
 
     fn step_completed(&mut self, result: &StepResult) -> Result<(), String> {
         self.store.step_completed(result)?;
+        let attempt = self
+            .store
+            .record()
+            .steps
+            .last()
+            .filter(|attempt| attempt.step_id == result.step_id)
+            .map_or(1, |attempt| attempt.attempt);
+        append_pipeline_history(
+            self.store.run_dir(),
+            &result.step_id,
+            attempt,
+            &result.outcome,
+        )?;
         println!("Completed step `{}` ({})", result.step_id, result.outcome);
         Ok(())
     }
@@ -865,6 +1046,14 @@ impl RunJournal for ConsoleRunJournal<'_> {
 
     fn step_failed(&mut self, step_id: &str, error: &str) -> Result<(), String> {
         self.store.step_failed(step_id, error)?;
+        let attempt = self
+            .store
+            .record()
+            .steps
+            .last()
+            .filter(|attempt| attempt.step_id == step_id)
+            .map_or(1, |attempt| attempt.attempt);
+        append_pipeline_history(self.store.run_dir(), step_id, attempt, "failure")?;
         eprintln!("Step `{step_id}` execution error: {error}");
         Ok(())
     }
@@ -943,6 +1132,101 @@ fn terminal_failure_exit_code(report: &RunReport, pipeline: &Pipeline) -> u8 {
 mod tests {
     use super::*;
     use factory_core::{Step, features::RunError};
+
+    #[test]
+    fn pipeline_history_is_numbered_chronological_and_shared_by_agent_memories() {
+        let root =
+            std::env::temp_dir().join(format!("factory-pipeline-history-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("01-agent.md"),
+            "# Run memory: agent\n\n## Verlauf\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("02-agent.md"),
+            "# Run memory: coder\n\n## 1. Handoff: Step `review` → Agent `coder` / Step `build` (Versuch 1)\n\n### 1.1 Fix issue\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("handoff-review.md"),
+            "artifact must remain untouched\n",
+        )
+        .unwrap();
+
+        append_pipeline_history(&root, "review", 1, "changes_requested").unwrap();
+        fs::write(
+            root.join("run.json"),
+            r#"{"steps":[{"step_id":"review","attempt":1},{"step_id":"build","attempt":2}]}"#,
+        )
+        .unwrap();
+        append_pipeline_history(&root, "build", 2, "success").unwrap();
+        let first = fs::read_to_string(root.join("01-agent.md")).unwrap();
+        let second = fs::read_to_string(root.join("02-agent.md")).unwrap();
+        for content in [&first, &second] {
+            assert!(content.contains("## Verlauf – Fortsetzung 1\n\n### 1. Verlauf: Step `review` (Versuch 1) — Outcome `changes_requested`"));
+            assert!(content.contains("## Verlauf – Fortsetzung 2\n\n### 2. Verlauf: Step `build` (Versuch 2) — Outcome `success`"));
+            assert!(content.find("Step `review`").unwrap() < content.find("Step `build`").unwrap());
+        }
+        assert_eq!(first.matches("### 1. Verlauf:").count(), 1);
+        assert!(!first.contains("Handoff 1"));
+        assert!(second.contains("Handoff 1; Findings 1.1"));
+        assert_eq!(
+            fs::read_to_string(root.join("handoff-review.md")).unwrap(),
+            "artifact must remain untouched\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pipeline_history_includes_agent_memories_with_three_digit_indices() {
+        let root =
+            std::env::temp_dir().join(format!("factory-many-memories-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        for index in 0..=100 {
+            fs::write(
+                root.join(format!("{index:02}-agent-{index}.md")),
+                format!("# Run memory: agent-{index}\n\n## Verlauf\n"),
+            )
+            .unwrap();
+        }
+        append_pipeline_history(&root, "build", 1, "success").unwrap();
+        let hundredth = fs::read_to_string(root.join("100-agent-100.md")).unwrap();
+        assert!(hundredth.contains("### 1. Verlauf: Step `build` (Versuch 1) — Outcome `success`"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pipeline_history_references_only_the_incoming_cycle_and_local_findings() {
+        let root =
+            std::env::temp_dir().join(format!("factory-cycle-references-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("run.json"), r#"{"steps":[{"step_id":"review","attempt":1},{"step_id":"build","attempt":1},{"step_id":"review","attempt":2},{"step_id":"build","attempt":2}]}"#).unwrap();
+        fs::write(root.join("01-reviewer.md"), "# Run memory: reviewer\n\n## 7. Handoff: Step `review` → Agent `coder` / Step `build` (Versuch 2)\n\nThe complete result is stored in an artifact.\n- Finding 7.1: Foreign local finding\n").unwrap();
+        fs::write(root.join("02-coder.md"), "# Run memory: coder\n\n## 3. Handoff: Step `review` → Agent `coder` / Step `build` (Versuch 2)\n\nThe complete result is stored in an artifact.\n- Finding 3.4: Current external finding\n- Finding 3.5: Another current finding\n\n## 9. Handoff: Step `review` → Agent `other` / Step `build` (Versuch 2)\n\n- Finding 9.1: Wrong target finding\n").unwrap();
+        append_pipeline_history(&root, "build", 2, "success").unwrap();
+        let reviewer = fs::read_to_string(root.join("01-reviewer.md")).unwrap();
+        let coder = fs::read_to_string(root.join("02-coder.md")).unwrap();
+        let reviewer_history = reviewer
+            .lines()
+            .find(|line| line.contains("Verlauf: Step `build`"))
+            .unwrap();
+        let coder_history = coder
+            .lines()
+            .find(|line| line.contains("Verlauf: Step `build`"))
+            .unwrap();
+        assert!(!reviewer_history.contains("Handoff") && !reviewer_history.contains("Findings"));
+        assert!(
+            coder_history.contains("Handoff 3; Findings 3.4, 3.5"),
+            "{coder_history}"
+        );
+        assert!(!coder_history.contains("Handoff 7") && !coder_history.contains("Findings 7."));
+        assert!(!coder_history.contains("Handoff 9"));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn validates_declared_pipeline_inputs_generically() {
@@ -1302,14 +1586,51 @@ mod tests {
             initialize_agent_memories(&run_dir, &pipeline, &agents, "Add the feature").unwrap();
         assert_eq!(memories.len(), 2);
         for path in memories.values() {
-            assert!(
-                fs::read_to_string(path)
-                    .unwrap()
-                    .contains("Add the feature")
-            );
+            let contents = fs::read_to_string(path).unwrap();
+            assert!(contents.contains("Add the feature"));
+            assert!(contents.contains("## Verlauf\n\n<!-- Chronologische Einträge append-only"));
         }
+        let existing_path = memories.get("coder").unwrap();
+        let existing = "# Existing run memory\n\n## Verlauf\n\n### 1. Verlauf: preserved\n";
+        fs::write(existing_path, existing).unwrap();
+        initialize_agent_memories(
+            existing_path.parent().unwrap(),
+            &pipeline,
+            &agents,
+            "replacement task",
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(existing_path).unwrap(), existing);
         let run_dir = memories.values().next().unwrap().parent().unwrap();
         assert_eq!(fs::read_dir(run_dir).unwrap().count(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_step_completion_does_not_append_successful_markdown_history() {
+        let root =
+            std::env::temp_dir().join(format!("factory-history-failed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut store = test_store(&root, "run");
+        let memory = root.join("run").join("agent.md");
+        fs::write(&memory, "# Agent\n\n## Verlauf\n").unwrap();
+        store.step_started("build").unwrap();
+        let run_dir = root.join("run");
+        fs::remove_file(run_dir.join("run.json")).unwrap();
+        fs::create_dir(run_dir.join("run.json")).unwrap();
+        let result = StepResult {
+            step_id: "build".into(),
+            outcome: "success".into(),
+            output: String::new(),
+            exit_code: None,
+            runner_attempts: 1,
+            handoff: None,
+        };
+        let mut journal = ConsoleRunJournal::new(&mut store);
+        assert!(journal.step_completed(&result).is_err());
+        let saved = fs::read_to_string(memory).unwrap();
+        assert!(!saved.contains("Outcome `success`"));
         fs::remove_dir_all(root).unwrap();
     }
 
